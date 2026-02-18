@@ -131,10 +131,10 @@ HELP_TEXT = """\
 
 @register(
     PLUGIN_ID,
-    "Zekun Wang",
-    "群体协作长篇小说插件 — 群友创意 + AI 写作（v2.1: 用户介入修正/删除指令/MikTeX PDF）",
-    "2.1.0",
-    "https://github.com/yourname/astrbot_plugin_novel",
+    "blueraina",
+    "群体协作长篇小说插件 — 群友创意 + AI 写作（每群独立/知识库/多AI打分/冲突投票/风格模仿/用户修正/EPUB/PDF导出）",
+    "2.4.0",
+    "https://github.com/blueraina/astrbot_plugin_novel",
 )
 class NovelPlugin(Star):
     """群体协作长篇小说 AstrBot 插件"""

@@ -2,10 +2,13 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.tmp
 .DS_Store
 .vscode/
 .idea/
+.env
 groups/
+data/
 *.log
 tmp/
 index-*.html
