@@ -1507,14 +1507,15 @@ class NovelPlugin(Star):
         if not ctx:
             yield event.plain_result("该指令仅允许在群聊使用。")
             return
-        # 从完整消息中提取书名和要求
-        content = text.strip()
+        # 从完整消息中提取书名和要求（优先从原始消息提取，避免框架截断参数）
+        content = ""
+        raw_msg = (event.message_str or "").strip()
+        for prefix in ["/群聊小说 开始构建 ", "/群聊小说 start "]:
+            if raw_msg.startswith(prefix):
+                content = raw_msg[len(prefix):].strip()
+                break
         if not content:
-            raw_msg = (event.message_str or "").strip()
-            for prefix in ["/群聊小说 开始构建 ", "/群聊小说 start "]:
-                if raw_msg.startswith(prefix):
-                    content = raw_msg[len(prefix):].strip()
-                    break
+            content = text.strip()
         if not content:
             yield event.plain_result(
                 "用法：/群聊小说 开始构建 <书名> <风格/主题要求>\n"
