@@ -454,7 +454,7 @@ AI 整理会：
 | 角色 | 配置项 | 推荐模型 |
 |------|--------|----------|
 | 创意评分 | `provider_idea_scoring` | 性价比模型即可 |
-| 写作生成 | `provider_writing` | 推荐强力模型（GPT-4 / Claude） |
+| 写作生成 | `provider_writing` | 推荐强力模型 |
 | 修正审校 | `provider_revision` | 推荐强力模型 |
 | 世界观整理 | `provider_worldview` | 性价比模型即可 |
 
