@@ -1,0 +1,5 @@
+# Dependency for EPUB export
+ebooklib
+
+# Dependency for PDF export (fallback for XeLaTeX)
+fpdf2

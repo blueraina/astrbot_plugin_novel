@@ -1,0 +1,73 @@
+{
+  "debug": {
+    "type": "bool",
+    "description": "是否开启调试日志",
+    "default": false
+  },
+  "allow_private_commands": {
+    "type": "bool",
+    "description": "是否允许在私聊中执行指令（默认仅群聊）",
+    "default": false
+  },
+  "enabled_groups": {
+    "type": "list",
+    "description": "允许使用本插件的群号列表（留空则所有群都可使用）。示例：[\"123456789\", \"987654321\"]",
+    "default": []
+  },
+  "score_threshold": {
+    "type": "int",
+    "description": "创意通过的最低加权平均分（0-100）",
+    "default": 70
+  },
+  "vote_duration_minutes": {
+    "type": "int",
+    "description": "冲突投票持续时间（分钟）",
+    "default": 30
+  },
+  "max_scene_length": {
+    "type": "int",
+    "description": "单场景最大字数",
+    "default": 2000
+  },
+  "provider_idea_scoring_1": {
+    "type": "string",
+    "description": "创意评分 AI-1 使用的模型（留空则使用全局默认模型）",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "provider_idea_scoring_2": {
+    "type": "string",
+    "description": "创意评分 AI-2 使用的模型（留空则使用全局默认模型）",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "provider_idea_scoring_3": {
+    "type": "string",
+    "description": "创意评分 AI-3 使用的模型（留空则使用全局默认模型）",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "provider_writing": {
+    "type": "string",
+    "description": "写作生成 AI 使用的模型（留空则使用全局默认模型）",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "provider_revision": {
+    "type": "string",
+    "description": "修正审校 AI 使用的模型（留空则使用全局默认模型）",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "provider_worldview": {
+    "type": "string",
+    "description": "世界观整理 AI 使用的模型（留空则使用全局默认模型）",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "chat_novel_threshold": {
+    "type": "int",
+    "description": "群聊小说每多少条消息触发一次章节生成",
+    "default": 50
+  }
+}
