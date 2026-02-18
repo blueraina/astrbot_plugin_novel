@@ -1510,12 +1510,16 @@ class NovelPlugin(Star):
         # 从完整消息中提取书名和要求（优先从原始消息提取，避免框架截断参数）
         content = ""
         raw_msg = (event.message_str or "").strip()
-        for prefix in ["/群聊小说 开始构建 ", "/群聊小说 start "]:
-            if raw_msg.startswith(prefix):
-                content = raw_msg[len(prefix):].strip()
+        logger.info(f"[{PLUGIN_ID}] cn_start: text='{text}', raw_msg='{raw_msg}'")
+        for prefix in ["/群聊小说 开始构建 ", "/群聊小说 start ",
+                       "群聊小说 开始构建 ", "群聊小说 start "]:
+            idx = raw_msg.find(prefix)
+            if idx >= 0:
+                content = raw_msg[idx + len(prefix):].strip()
                 break
         if not content:
             content = text.strip()
+        logger.info(f"[{PLUGIN_ID}] cn_start: parsed content='{content}'")
         if not content:
             yield event.plain_result(
                 "用法：/群聊小说 开始构建 <书名> <风格/主题要求>\n"
