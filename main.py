@@ -1481,6 +1481,7 @@ class NovelPlugin(Star):
 ▸ /群聊小说 帮助          显示此帮助
 ▸ /群聊小说 开始构建 <书名> <要求>  开始收集群聊消息并构建小说
 ▸ /群聊小说 停止          停止收集
+▸ /群聊小说 继续          继续收集（从停止状态恢复）
 ▸ /群聊小说 状态          查看进度
 ▸ /群聊小说 人物列表       查看角色
 ▸ /群聊小说 人物 <名字>    角色详情
@@ -1572,7 +1573,38 @@ class NovelPlugin(Star):
             f"⏹ 群聊小说已停止收集。\n"
             f"📖 共生成 {chapters} 章\n"
             f"📝 {pending} 条未处理消息已保留\n"
-            f"💾 使用 /群聊小说 导出 pdf 可导出已有内容"
+            f"💾 使用 /群聊小说 导出 pdf 可导出已有内容\n"
+            f"▶️ 使用 /群聊小说 继续 可恢复收集"
+        )
+
+    @chat_novel_cmd.command("继续", alias={"resume"})
+    async def cn_resume(self, event: AstrMessageEvent):
+        """从停止状态继续收集群聊消息"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+        if ctx.chat_novel.is_collecting():
+            yield event.plain_result("⚠️ 群聊小说已经在收集中，无需继续。")
+            return
+        ok = ctx.chat_novel.resume()
+        if not ok:
+            yield event.plain_result(
+                "⚠️ 没有可恢复的群聊小说。\n"
+                "请使用 /群聊小说 开始构建 <书名> <要求> 创建新的群聊小说。"
+            )
+            return
+        novel = ctx.chat_novel._load_novel()
+        title = novel.get("title", "群聊物语")
+        chapters = ctx.chat_novel.get_chapter_count()
+        pending = ctx.chat_novel.get_pending_count()
+        yield event.plain_result(
+            f"▶️ 群聊小说《{title}》继续收集！\n"
+            f"📖 已有 {chapters} 章\n"
+            f"📝 待处理消息 {pending} 条\n"
+            f"群友们继续聊天即可，AI 会自动生成新章节。"
         )
 
     @chat_novel_cmd.command("状态", alias={"status"})

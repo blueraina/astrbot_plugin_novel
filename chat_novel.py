@@ -93,6 +93,18 @@ class ChatNovelEngine:
         self._save_novel(novel)
         logger.info(f"[{PLUGIN_ID}] 群聊小说停止收集")
 
+    def resume(self) -> bool:
+        """继续收集（从停止状态恢复，不清空数据）。成功返回 True。"""
+        novel = self._load_novel()
+        if novel.get("status") == "collecting":
+            return False  # 已经在收集中
+        if not novel.get("title"):
+            return False  # 从未初始化过
+        novel["status"] = "collecting"
+        self._save_novel(novel)
+        logger.info(f"[{PLUGIN_ID}] 群聊小说继续收集")
+        return True
+
     # ------------------------------------------------------------------
     # 消息收集
     # ------------------------------------------------------------------
