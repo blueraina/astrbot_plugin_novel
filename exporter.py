@@ -17,6 +17,19 @@ from .utils import PLUGIN_ID
 def export_txt(novel: dict, output_path: Path) -> Path:
     """导出为纯文本"""
     lines = [f"《{novel['title']}》", ""]
+    # 出场人物章节
+    characters = novel.get("characters", [])
+    if characters:
+        lines.append("【出场人物】")
+        for char in characters:
+            novel_name = char.get("novel_name", "")
+            real_name = char.get("real_name", "")
+            desc = char.get("description", "")
+            if novel_name and real_name:
+                lines.append(f"  {novel_name}（{real_name}）：{desc}")
+            elif novel_name:
+                lines.append(f"  {novel_name}：{desc}")
+        lines.append("")
     if novel.get("synopsis"):
         lines.append(f"【简介】{novel['synopsis']}")
         lines.append("")
@@ -67,6 +80,25 @@ def export_epub(novel: dict, output_path: Path) -> Optional[Path]:
 
     chapters_epub = []
     spine = ["nav"]
+
+    # 出场人物页
+    characters = novel.get("characters", [])
+    if characters:
+        chars_page = epub.EpubHtml(title="出场人物", file_name="characters.xhtml", lang="zh")
+        chars_html_parts = [f'<h1>出场人物</h1>']
+        for char in characters:
+            novel_name = char.get("novel_name", "")
+            real_name = char.get("real_name", "")
+            desc = char.get("description", "")
+            if novel_name and real_name:
+                chars_html_parts.append(f'<p><strong>{novel_name}</strong>（{real_name}）：{desc}</p>')
+            elif novel_name:
+                chars_html_parts.append(f'<p><strong>{novel_name}</strong>：{desc}</p>')
+        chars_page.content = "\n".join(chars_html_parts)
+        chars_page.add_item(style)
+        book.add_item(chars_page)
+        spine.append(chars_page)
+        chapters_epub.append(epub.Link("characters.xhtml", "出场人物", "characters"))
 
     # 简介页
     if novel.get("synopsis"):
@@ -197,6 +229,25 @@ def _build_latex_content(novel: dict) -> str:
         r"\newpage",
         "",
     ]
+
+    # 出场人物章节
+    characters = novel.get("characters", [])
+    if characters:
+        tex_lines.append(r"\begin{center}")
+        tex_lines.append(r"\textbf{【出场人物】}")
+        tex_lines.append(r"\end{center}")
+        tex_lines.append("")
+        for char in characters:
+            novel_name = char.get("novel_name", "")
+            real_name = char.get("real_name", "")
+            desc = char.get("description", "")
+            if novel_name and real_name:
+                tex_lines.append(r"\textbf{" + _escape_latex(novel_name) + r"}（" + _escape_latex(real_name) + r"）：" + _escape_latex(desc))
+            elif novel_name:
+                tex_lines.append(r"\textbf{" + _escape_latex(novel_name) + r"}：" + _escape_latex(desc))
+            tex_lines.append("")
+        tex_lines.append(r"\newpage")
+        tex_lines.append("")
 
     if novel.get("synopsis"):
         tex_lines.append(r"\begin{center}")
@@ -335,6 +386,24 @@ def _try_fpdf2(novel: dict, output_path: Path) -> Optional[Path]:
         pdf.ln(20)
         pdf.set_font_size(11)
         pdf.multi_cell(0, 7, f"【简介】{novel['synopsis']}")
+
+    # ---- 出场人物 ----
+    characters = novel.get("characters", [])
+    if characters:
+        pdf.add_page()
+        pdf.set_font_size(22)
+        pdf.cell(0, 15, "出场人物", align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(5)
+        pdf.set_font_size(11)
+        for char in characters:
+            novel_name = char.get("novel_name", "")
+            real_name = char.get("real_name", "")
+            desc = char.get("description", "")
+            if novel_name and real_name:
+                pdf.multi_cell(0, 7, f"{novel_name}（{real_name}）：{desc}")
+            elif novel_name:
+                pdf.multi_cell(0, 7, f"{novel_name}：{desc}")
+            pdf.ln(2)
 
     # ---- 正文 ----
     for ch in novel.get("chapters", []):

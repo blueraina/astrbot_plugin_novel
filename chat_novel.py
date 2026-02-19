@@ -453,6 +453,7 @@ class ChatNovelEngine:
             "title": novel.get("title", "群聊物语"),
             "synopsis": synopsis,
             "contributors": novel.get("contributors", []),
+            "characters": novel.get("characters", []),
             "chapters": [],
         }
         for ch in novel.get("chapters", []):
