@@ -233,9 +233,9 @@ def _build_latex_content(novel: dict) -> str:
     # 出场人物章节
     characters = novel.get("characters", [])
     if characters:
-        tex_lines.append(r"\begin{center}")
-        tex_lines.append(r"\textbf{【出场人物】}")
-        tex_lines.append(r"\end{center}")
+        tex_lines.append(r"\section*{出场人物}")
+        tex_lines.append(r"\phantomsection")
+        tex_lines.append(r"\addcontentsline{toc}{section}{出场人物}")
         tex_lines.append("")
         for char in characters:
             novel_name = char.get("novel_name", "")
@@ -250,9 +250,9 @@ def _build_latex_content(novel: dict) -> str:
         tex_lines.append("")
 
     if novel.get("synopsis"):
-        tex_lines.append(r"\begin{center}")
-        tex_lines.append(r"\textbf{【简介】}")
-        tex_lines.append(r"\end{center}")
+        tex_lines.append(r"\section*{简介}")
+        tex_lines.append(r"\phantomsection")
+        tex_lines.append(r"\addcontentsline{toc}{section}{简介}")
         tex_lines.append("")
         # 按换行符分段，使风格和剧情简介分开显示
         for para in novel["synopsis"].split("\n"):
@@ -379,10 +379,18 @@ def _try_fpdf2(novel: dict, output_path: Path) -> Optional[Path]:
     pdf.cell(0, 20, title, align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font_size(14)
     pdf.ln(10)
+    # 封面书签
+    pdf.start_section("封面")
+
     contributors = novel.get("contributors", [])
     author_text = f"作者: {', '.join(contributors)}" if contributors else "群体协作小说"
     pdf.multi_cell(0, 10, author_text, align="C", new_x="LMARGIN", new_y="NEXT")
     if novel.get("synopsis"):
+        pdf.add_page()
+        # 如果前面没有换页，简介可能接在封面后。如果想让简介独立一页或有书签：
+        # 这里简介一般是在封面上，或者接在后面。用户希望目录有简介。
+        # fpdf2 的 start_section 会记录当前 Y 位置为书签跳转点。
+        pdf.start_section("简介") 
         pdf.ln(20)
         pdf.set_font_size(11)
         pdf.multi_cell(0, 7, f"【简介】{novel['synopsis']}")
@@ -391,6 +399,7 @@ def _try_fpdf2(novel: dict, output_path: Path) -> Optional[Path]:
     characters = novel.get("characters", [])
     if characters:
         pdf.add_page()
+        pdf.start_section("出场人物")
         pdf.set_font_size(22)
         pdf.cell(0, 15, "出场人物", align="C", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(5)
@@ -408,8 +417,11 @@ def _try_fpdf2(novel: dict, output_path: Path) -> Optional[Path]:
     # ---- 正文 ----
     for ch in novel.get("chapters", []):
         pdf.add_page()
+    for ch in novel.get("chapters", []):
+        pdf.add_page()
         ch_num = ch.get("number", "?")
         ch_title = ch.get("title", "")
+        pdf.start_section(f"第{ch_num}章 {ch_title}")
         pdf.set_font_size(22)
         pdf.cell(0, 15, f"第{ch_num}章 {ch_title}", align="C", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(5)
