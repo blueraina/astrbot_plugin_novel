@@ -40,6 +40,8 @@ _DEFAULT_CHAT_NOVEL: dict = {
     "global_summary": "",
     "contributors": [],           # 参与聊天的群友昵称列表
     "created_at": "",
+    "cover_auto_generate": True,  # 导出时是否每次重新生成封面
+    "preview_enabled": True,      # 生成章节后是否发送预览文本到群聊
 }
 
 
@@ -195,6 +197,28 @@ class ChatNovelEngine:
     def get_chapters(self) -> list:
         novel = self._load_novel()
         return novel.get("chapters", [])
+
+    def get_cover_auto_generate(self) -> bool:
+        """获取是否每次导出自动重新生成封面"""
+        novel = self._load_novel()
+        return novel.get("cover_auto_generate", True)
+
+    def set_cover_auto_generate(self, val: bool) -> None:
+        """设置是否每次导出自动重新生成封面"""
+        novel = self._load_novel()
+        novel["cover_auto_generate"] = val
+        self._save_novel(novel)
+
+    def get_preview_enabled(self) -> bool:
+        """获取是否在生成章节后发送预览文本"""
+        novel = self._load_novel()
+        return novel.get("preview_enabled", True)
+
+    def set_preview_enabled(self, val: bool) -> None:
+        """设置是否在生成章节后发送预览文本"""
+        novel = self._load_novel()
+        novel["preview_enabled"] = val
+        self._save_novel(novel)
 
     def get_chapter_count(self) -> int:
         return len(self.get_chapters())
@@ -505,6 +529,7 @@ class ChatNovelEngine:
             f"  总字数：{total_chars}",
             f"  人物数：{char_count}",
             f"  待处理消息：{pending} 条",
+            f"  章节预览：{'✅ 开启' if novel.get('preview_enabled', True) else '⏹ 关闭'}",
         ]
         if novel.get("global_summary"):
             lines.append(f"  故事进展：{truncate_text(novel['global_summary'], 200)}")

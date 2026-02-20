@@ -45,7 +45,7 @@ def export_txt(novel: dict, output_path: Path) -> Path:
     return output_path
 
 
-def export_epub(novel: dict, output_path: Path) -> Optional[Path]:
+def export_epub(novel: dict, output_path: Path, cover_image_path: Optional[Path] = None) -> Optional[Path]:
     """导出为 EPUB 电子书"""
     try:
         from ebooklib import epub
@@ -61,6 +61,35 @@ def export_epub(novel: dict, output_path: Path) -> Optional[Path]:
     contributors = novel.get("contributors", [])
     author_text = f"作者: {', '.join(contributors)}" if contributors else "群体协作"
     book.add_author(author_text)
+
+    # 封面图片
+    cover_page = None
+    if cover_image_path and cover_image_path.exists():
+        try:
+            cover_data = cover_image_path.read_bytes()
+            # 根据扩展名判断 MIME 类型
+            ext = cover_image_path.suffix.lower()
+            if ext in (".jpg", ".jpeg"):
+                cover_fname = "cover.jpg"
+            else:
+                cover_fname = "cover.png"
+            book.set_cover(cover_fname, cover_data)
+            # 手动创建封面页 HTML 并加入 spine（部分阅读器需要）
+            cover_page = epub.EpubHtml(
+                title="封面", file_name="cover_page.xhtml", lang="zh"
+            )
+            cover_page.content = (
+                '<div style="text-align:center;height:100%;display:flex;'
+                'align-items:center;justify-content:center">'
+                f'<img src="{cover_fname}" style="max-width:100%;'
+                f'max-height:100%" alt="封面"/>'
+                '</div>'
+            )
+            book.add_item(cover_page)
+            logger.info(f"[{PLUGIN_ID}] EPUB 封面已设置：{cover_image_path}")
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_ID}] EPUB 封面设置失败: {e}")
+            cover_page = None
 
     # 样式
     style = epub.EpubItem(
@@ -142,6 +171,9 @@ def export_epub(novel: dict, output_path: Path) -> Optional[Path]:
 
     # 目录和书脊
     book.toc = chapters_epub
+    # 封面页插入 spine 最前面
+    if cover_page:
+        spine.insert(0, cover_page)
     book.spine = spine
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
@@ -202,7 +234,7 @@ def _escape_latex_with_md(text: str) -> str:
     return ''.join(result)
 
 
-def _build_latex_content(novel: dict) -> str:
+def _build_latex_content(novel: dict, cover_image_path: Optional[Path] = None) -> str:
     """构建 LaTeX 文档内容"""
     title = novel.get("title", "未命名小说")
     contributors = novel.get("contributors", [])
@@ -214,6 +246,8 @@ def _build_latex_content(novel: dict) -> str:
         r"\usepackage{titlesec}",
         r"\usepackage{enumitem}",
         r"\usepackage{hyperref}",
+        r"\usepackage{graphicx}",
+        r"\usepackage{tikz}",
         r"\hypersetup{colorlinks=true, linkcolor=blue, pdfauthor={" + _escape_latex(author_text) + r"}, pdftitle={" + _escape_latex(title) + r"}}",
         "",
         r"\titleformat{\section}{\centering\LARGE\bfseries}{第\thesection 章}{1em}{}",
@@ -224,11 +258,30 @@ def _build_latex_content(novel: dict) -> str:
         r"\date{}",
         "",
         r"\begin{document}",
+    ]
+
+    # 如果有封面图片，插入全页封面
+    if cover_image_path and cover_image_path.exists():
+        # 使用文件名（图片会被复制到 build 目录）
+        img_fname = cover_image_path.name
+        tex_lines.extend([
+            r"\thispagestyle{empty}",
+            r"\begin{tikzpicture}[remember picture,overlay]",
+            r"\node[inner sep=0pt] at (current page.center) {%",
+            r"  \includegraphics[width=\paperwidth,height=\paperheight]{" + img_fname + r"}%",
+            r"};",
+            r"\end{tikzpicture}",
+            r"\null",
+            r"\newpage",
+            "",
+        ])
+
+    tex_lines.extend([
         r"\maketitle",
         r"\tableofcontents",
         r"\newpage",
         "",
-    ]
+    ])
 
     # 出场人物章节
     characters = novel.get("characters", [])
@@ -284,18 +337,23 @@ def _build_latex_content(novel: dict) -> str:
     return "\n".join(tex_lines)
 
 
-def _try_xelatex(novel: dict, output_path: Path) -> Optional[Path]:
+def _try_xelatex(novel: dict, output_path: Path, cover_image_path: Optional[Path] = None) -> Optional[Path]:
     """
     尝试使用 MikTeX xelatex 编译 PDF。
     返回 Path 表示成功，None 表示失败。
     """
-    tex_content = _build_latex_content(novel)
+    tex_content = _build_latex_content(novel, cover_image_path)
 
     build_dir = output_path.parent / "_latex_build"
     try:
         build_dir.mkdir(parents=True, exist_ok=True)
         tex_path = build_dir / "novel.tex"
         tex_path.write_text(tex_content, encoding="utf-8")
+
+        # 如果有封面图片，复制到编译目录
+        if cover_image_path and cover_image_path.exists():
+            import shutil as _shutil
+            _shutil.copy2(str(cover_image_path), str(build_dir / cover_image_path.name))
 
         env = os.environ.copy()
         env["MIKTEX_ENABLE_INSTALLER"] = "yes"
@@ -354,7 +412,7 @@ def _try_xelatex(novel: dict, output_path: Path) -> Optional[Path]:
             pass
 
 
-def _try_fpdf2(novel: dict, output_path: Path) -> Optional[Path]:
+def _try_fpdf2(novel: dict, output_path: Path, cover_image_path: Optional[Path] = None) -> Optional[Path]:
     """使用 fpdf2 生成 PDF（不需要外部 LaTeX 环境）"""
     try:
         from fpdf import FPDF
@@ -372,21 +430,43 @@ def _try_fpdf2(novel: dict, output_path: Path) -> Optional[Path]:
     pdf.set_auto_page_break(auto=True, margin=20)
     _setup_chinese_font(pdf)
 
-    # ---- 封面 ----
-    pdf.add_page()
-    pdf.set_font_size(32)
-    pdf.ln(60)
-    pdf.cell(0, 20, title, align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font_size(14)
-    pdf.ln(10)
-    # 封面书签
-    pdf.start_section("封面")
+    # ---- AI 封面图片 ----
+    if cover_image_path and cover_image_path.exists():
+        try:
+            pdf.add_page()
+            # 禁用自动分页，避免全页图片触发提前换页
+            pdf.set_auto_page_break(auto=False)
+            # A4 尺寸 210x297mm，全页显示封面图
+            pdf.image(
+                str(cover_image_path),
+                x=0, y=0,
+                w=210, h=297,
+            )
+            pdf.start_section("封面")
+            pdf.set_auto_page_break(auto=True, margin=20)
+            logger.info(f"[{PLUGIN_ID}] fpdf2 封面图已插入")
+        except Exception as e:
+            pdf.set_auto_page_break(auto=True, margin=20)
+            logger.warning(f"[{PLUGIN_ID}] fpdf2 封面图插入失败: {e}")
+            # 封面图插入失败，回退到文字封面
+            cover_image_path = None
 
+    # ---- 文字封面（无图片时显示） ----
+    if not cover_image_path or not cover_image_path.exists():
+        pdf.add_page()
+        pdf.set_font_size(32)
+        pdf.ln(60)
+        pdf.cell(0, 20, title, align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font_size(14)
+        pdf.ln(10)
+        pdf.start_section("封面")
+
+    # 作者信息和简介始终另开新页
+    pdf.add_page()
     contributors = novel.get("contributors", [])
     author_text = f"作者: {', '.join(contributors)}" if contributors else "群体协作小说"
     pdf.multi_cell(0, 10, author_text, align="C", new_x="LMARGIN", new_y="NEXT")
     if novel.get("synopsis"):
-        pdf.add_page()
         # 如果前面没有换页，简介可能接在封面后。如果想让简介独立一页或有书签：
         # 这里简介一般是在封面上，或者接在后面。用户希望目录有简介。
         # fpdf2 的 start_section 会记录当前 Y 位置为书签跳转点。
@@ -479,17 +559,17 @@ def _setup_chinese_font(pdf):
 # =====================================================================
 # PDF 导出入口：xelatex 优先，fpdf2 回退
 # =====================================================================
-def export_pdf(novel: dict, output_path: Path) -> Optional[Path]:
+def export_pdf(novel: dict, output_path: Path, cover_image_path: Optional[Path] = None) -> Optional[Path]:
     """
     导出为 PDF。优先尝试 MikTeX xelatex（更好的排版质量），
     如果 xelatex 不可用或失败则自动回退到 fpdf2。
     """
     # 尝试 xelatex
-    result = _try_xelatex(novel, output_path)
+    result = _try_xelatex(novel, output_path, cover_image_path)
     if result:
         return result
 
     logger.info(f"[{PLUGIN_ID}] xelatex 不可用，回退到 fpdf2 生成 PDF")
 
     # 回退到 fpdf2
-    return _try_fpdf2(novel, output_path)
+    return _try_fpdf2(novel, output_path, cover_image_path)

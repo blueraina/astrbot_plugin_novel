@@ -27,13 +27,14 @@ try:
 except Exception:  # pragma: no cover
     AstrBotConfig = Any  # type: ignore
 
-from .utils import PLUGIN_ID, truncate_text
+from .utils import PLUGIN_ID, truncate_text, generate_cover_image
 from .knowledge_base import KnowledgeBase
 from .idea_manager import IdeaManager
 from .novel_engine import NovelEngine
 from .vote_manager import VoteManager
 from .exporter import export_txt, export_epub, export_pdf
 from .chat_novel import ChatNovelEngine
+from .prompts import COVER_IMAGE_PROMPT_TEMPLATE
 
 
 def _resolve_data_dir(plugin_name: str) -> Path:
@@ -252,6 +253,59 @@ class NovelPlugin(Star):
         if not name:
             name = event.get_sender_id() or "unknown"
         ctx.engine.add_contributor(str(name))
+
+    async def _generate_cover(self, novel: dict, output_path: Path) -> Optional[Path]:
+        """为小说生成 AI 封面图片"""
+        provider = self._get_provider_for("cover_image")
+
+        # 组装提示词
+        user_prompt = self._cfg("cover_image_prompt", "").strip()
+        if not user_prompt:
+            user_prompt = "一张高品质的小说封面，画风精美细腻，光影层次丰富，具有强烈的故事感与氛围感，色彩和谐统一"
+
+        synopsis = novel.get("synopsis", "")
+        if not synopsis:
+            synopsis = novel.get("global_summary", "暂无简介")
+
+        title = novel.get("title", "未命名小说")
+
+        final_prompt = COVER_IMAGE_PROMPT_TEMPLATE.format(
+            user_prompt=user_prompt,
+            title=title,
+            synopsis=truncate_text(synopsis, 500),
+        )
+
+        # 参考图（图生图模式）
+        ref_path = None
+        ref_cfg = self._cfg("cover_reference_image", "").strip()
+        if ref_cfg:
+            ref_path = Path(ref_cfg)
+            if not ref_path.exists():
+                logger.warning(f"[{PLUGIN_ID}] 参考图不存在：{ref_path}，将使用纯文生图")
+                ref_path = None
+
+        logger.info(f"[{PLUGIN_ID}] 正在生成封面图片...")
+        timeout = self._cfg_int("cover_image_timeout", 180)
+        model = self._cfg("cover_image_model", "").strip()
+        img_size = self._cfg("cover_image_size", "").strip() or "1024x1536"
+        try:
+            result = await generate_cover_image(
+                provider=provider,
+                prompt=final_prompt,
+                output_path=output_path,
+                size=img_size,
+                reference_image_path=ref_path,
+                timeout=timeout,
+                model_name=model,
+            )
+            if result:
+                logger.info(f"[{PLUGIN_ID}] 封面图片生成成功：{result}")
+            else:
+                logger.warning(f"[{PLUGIN_ID}] 封面图片生成返回空，将跳过封面")
+            return result
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_ID}] 封面生成异常: {e}，将跳过封面")
+            return None
 
     async def _maybe_refine_worldview(self, ctx: GroupContext) -> None:
         """在关键操作后自动整理世界观（每5次操作触发一次）"""
@@ -1091,6 +1145,13 @@ class NovelPlugin(Star):
         export_dir = ctx.data_dir / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
 
+        # 封面生成（仅 EPUB/PDF）
+        cover_path = None
+        if fmt in ("epub", "pdf") and self._cfg_bool("enable_cover_image", False):
+            cover_path = await self._generate_cover(
+                novel, export_dir / "cover.png"
+            )
+
         if fmt == "txt":
             out_path = export_dir / f"{title}.txt"
             export_txt(novel, out_path)
@@ -1111,7 +1172,7 @@ class NovelPlugin(Star):
         elif fmt == "epub":
             out_path = export_dir / f"{title}.epub"
             yield event.plain_result("📚 正在生成 EPUB...")
-            result = export_epub(novel, out_path)
+            result = export_epub(novel, out_path, cover_path)
             if result:
                 if FileComp is not None:
                     try:
@@ -1132,7 +1193,7 @@ class NovelPlugin(Star):
         elif fmt == "pdf":
             out_path = export_dir / f"{title}.pdf"
             yield event.plain_result("📄 正在生成 PDF...")
-            result = export_pdf(novel, out_path)
+            result = export_pdf(novel, out_path, cover_path)
             if result:
                 if FileComp is not None:
                     try:
@@ -1457,15 +1518,31 @@ class NovelPlugin(Star):
                     )
                     chapter = await ctx.chat_novel.generate_chapter(provider)
                     if chapter:
-                        content_preview = chapter.get("content", "")[:800]
-                        yield event.plain_result(
-                            f"📖 群聊小说 第{chapter['number']}章「{chapter['title']}」已完成！\n\n"
-                            f"{content_preview}\n\n"
-                            f"{'...(内容过长已截断)' if len(chapter.get('content', '')) > 800 else ''}\n"
-                            f"📚 共 {len(chapter.get('content', ''))} 字\n"
-                            f"💾 使用 /群聊小说 阅读 {chapter['number']} 查看全文\n"
-                            f"💾 使用 /群聊小说 导出 pdf 可导出全文"
-                        )
+                        preview_enabled = ctx.chat_novel.get_preview_enabled()
+                        preview_limit = self._cfg_int("chat_novel_preview_limit", 800)
+                        content = chapter.get("content", "")
+                        if preview_enabled and content:
+                            if preview_limit > 0:
+                                content_preview = content[:preview_limit]
+                                truncated = len(content) > preview_limit
+                            else:
+                                content_preview = content
+                                truncated = False
+                            yield event.plain_result(
+                                f"📖 群聊小说 第{chapter['number']}章「{chapter['title']}」已完成！\n\n"
+                                f"{content_preview}\n\n"
+                                f"{'...(内容过长已截断)' if truncated else ''}\n"
+                                f"📚 共 {len(content)} 字\n"
+                                f"💾 使用 /群聊小说 阅读 {chapter['number']} 查看全文\n"
+                                f"💾 使用 /群聊小说 导出 pdf 可导出全文"
+                            )
+                        else:
+                            yield event.plain_result(
+                                f"📖 群聊小说 第{chapter['number']}章「{chapter['title']}」已完成！\n"
+                                f"📚 共 {len(content)} 字\n"
+                                f"💾 使用 /群聊小说 阅读 {chapter['number']} 查看全文\n"
+                                f"💾 使用 /群聊小说 导出 pdf 可导出全文"
+                            )
                     else:
                         yield event.plain_result("⚠️ 群聊小说章节生成失败，请稍后重试。")
                 except Exception as e:
@@ -1487,6 +1564,10 @@ class NovelPlugin(Star):
 ▸ /群聊小说 人物 <名字>    角色详情
 ▸ /群聊小说 阅读 [章节号]   阅读章节
 ▸ /群聊小说 导出 pdf/epub/txt  导出小说
+▸ /群聊小说 封面生成 停止   停止每次导出重新生成封面
+▸ /群聊小说 封面生成 开始   恢复每次导出重新生成封面
+▸ /群聊小说 关闭预览        关闭生成章节后的预览文本
+▸ /群聊小说 开启预览        开启生成章节后的预览文本
 ▸ /群聊小说 修改名称 <新书名>  修改小说名称
 ▸ /群聊小说 删除          删除本群所有小说数据
 """
@@ -1744,6 +1825,73 @@ class NovelPlugin(Star):
             f"如需重新开始，请使用 /群聊小说 开始构建 <要求>"
         )
 
+    @chat_novel_cmd.command("封面生成")
+    async def cn_cover_toggle(self, event: AstrMessageEvent, action: str = ""):
+        """控制封面自动生成开关"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+
+        action = action.strip()
+        if action == "停止":
+            ctx.chat_novel.set_cover_auto_generate(False)
+            yield event.plain_result(
+                "🖼️ 封面自动生成已关闭。\n"
+                "后续导出将复用已有封面图片（如有）。\n"
+                "使用 /群聊小说 封面生成 开始 可重新开启。"
+            )
+        elif action == "开始":
+            ctx.chat_novel.set_cover_auto_generate(True)
+            yield event.plain_result(
+                "🖼️ 封面自动生成已开启。\n"
+                "每次导出 EPUB/PDF 时将重新生成封面。"
+            )
+        else:
+            current = ctx.chat_novel.get_cover_auto_generate()
+            status = "✅ 开启" if current else "⏹ 关闭"
+            yield event.plain_result(
+                f"🖼️ 封面自动生成状态：{status}\n\n"
+                f"用法：\n"
+                f"▸ /群聊小说 封面生成 停止  — 停止每次自动生成\n"
+                f"▸ /群聊小说 封面生成 开始  — 恢复每次自动生成"
+            )
+
+    @chat_novel_cmd.command("关闭预览")
+    async def cn_preview_off(self, event: AstrMessageEvent):
+        """关闭生成章节后的预览文本"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+        ctx.chat_novel.set_preview_enabled(False)
+        yield event.plain_result(
+            "🔇 章节预览已关闭。\n"
+            "生成新章节后将仅发送完成通知，不发送正文预览。\n"
+            "使用 /群聊小说 开启预览 可重新开启。"
+        )
+
+    @chat_novel_cmd.command("开启预览")
+    async def cn_preview_on(self, event: AstrMessageEvent):
+        """开启生成章节后的预览文本"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+        ctx.chat_novel.set_preview_enabled(True)
+        preview_limit = self._cfg_int("chat_novel_preview_limit", 800)
+        yield event.plain_result(
+            "🔔 章节预览已开启。\n"
+            f"生成新章节后将发送前 {preview_limit} 字的正文预览。\n"
+            "使用 /群聊小说 关闭预览 可关闭。"
+        )
+
     @chat_novel_cmd.command("导出", alias={"export"})
     async def cn_export(self, event: AstrMessageEvent, text: str = ""):
         """导出群聊小说"""
@@ -1764,6 +1912,21 @@ class NovelPlugin(Star):
         export_dir = ctx.data_dir / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
 
+        # 封面生成（仅 EPUB/PDF）
+        cover_path = None
+        if fmt in ("epub", "pdf") and self._cfg_bool("enable_cover_image", False):
+            cover_file = export_dir / "cover.png"
+            auto_gen = ctx.chat_novel.get_cover_auto_generate()
+            if auto_gen or not cover_file.exists():
+                yield event.plain_result("🖼️ 正在生成封面图片...")
+                cover_path = await self._generate_cover(
+                    novel_data, cover_file
+                )
+            else:
+                # 复用已有封面
+                cover_path = cover_file
+                logger.info(f"[{PLUGIN_ID}] 复用已有封面：{cover_file}")
+
         try:
             if fmt == "txt":
                 txt_content = ctx.chat_novel.export_text()
@@ -1771,10 +1934,10 @@ class NovelPlugin(Star):
                 out.write_text(txt_content, encoding="utf-8")
             elif fmt == "epub":
                 yield event.plain_result("📚 正在生成 EPUB...")
-                out = export_epub(novel_data, export_dir / f"{title}.epub")
+                out = export_epub(novel_data, export_dir / f"{title}.epub", cover_path)
             elif fmt == "pdf":
                 yield event.plain_result("📄 正在生成 PDF...")
-                out = export_pdf(novel_data, export_dir / f"{title}.pdf")
+                out = export_pdf(novel_data, export_dir / f"{title}.pdf", cover_path)
             else:
                 yield event.plain_result(f"不支持的格式：{fmt}。可选：txt / epub / pdf")
                 return

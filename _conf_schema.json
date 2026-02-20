@@ -69,5 +69,46 @@
     "type": "int",
     "description": "群聊小说每多少条消息触发一次章节生成",
     "default": 50
+  },
+  "chat_novel_preview_limit": {
+    "type": "int",
+    "description": "群聊小说生成章节后发送到群聊的预览文本字数上限（0 表示不限制）",
+    "default": 800
+  },
+  "enable_cover_image": {
+    "type": "bool",
+    "description": "导出 EPUB/PDF 时是否用 AI 生成封面图片（需配置绘图模型）",
+    "default": false
+  },
+  "provider_cover_image": {
+    "type": "string",
+    "description": "封面绘图 AI 模型（需支持 OpenAI images API 格式，如 Gemini Image / DALL-E）",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "cover_image_model": {
+    "type": "string",
+    "description": "绘图模型名称（如 seedream-3.0、dall-e-3 等，留空则由 API 自动选择）",
+    "default": ""
+  },
+  "cover_image_size": {
+    "type": "string",
+    "description": "封面图片尺寸（宽x高），如 1024x1536（DALL-E）、2048x2048（Doubao seedream）等，留空使用默认 1024x1536",
+    "default": ""
+  },
+  "cover_image_prompt": {
+    "type": "string",
+    "description": "封面绘图自定义提示词（会与小说剧情简介合并生成最终提示词，留空使用默认）",
+    "default": "一张高品质的小说封面，画风精美细腻，光影层次丰富，具有强烈的故事感与氛围感，色彩和谐统一"
+  },
+  "cover_reference_image": {
+    "type": "string",
+    "description": "封面参考图片路径（留空则纯文生图，填写后 AI 会模仿参考图风格生成封面）",
+    "default": ""
+  },
+  "cover_image_timeout": {
+    "type": "int",
+    "description": "封面图片生成超时时间（秒），生图模型较慢时可适当增大",
+    "default": 180
   }
 }
