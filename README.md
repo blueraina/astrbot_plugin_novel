@@ -114,8 +114,22 @@ pip install ebooklib fpdf2
 | `provider_writing` | 写作生成 AI | 场景写作 |
 | `provider_revision` | 修正审校 AI | 场景/章节修正 |
 | `provider_worldview` | 世界观整理 AI | 世界观自动/手动整理 |
+| `provider_cover_image` | 封面绘图 AI | 封面图片生成 |
 
 > 💡 建议：写作和修正使用较强的模型（如 GPT-4 / Claude），创意评分和世界观整理可使用性价比更高的模型。
+
+### 封面图片配置
+
+导出 EPUB/PDF 时可用 AI 生成封面图片，需先开启并配置绘图模型：
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `enable_cover_image` | bool | false | 导出 EPUB/PDF 时是否用 AI 生成封面图片 |
+| `cover_image_model` | string | `""` | 绘图模型名称（如 `seedream-3.0`、`dall-e-3`，留空由 API 自动选择） |
+| `cover_image_size` | string | `""` | 封面图片尺寸（如 `1024x1536`，留空使用默认） |
+| `cover_image_prompt` | string | *预置提示词* | 封面绘图自定义提示词（会与剧情简介合并） |
+| `cover_reference_image` | string | `""` | 参考图片路径（留空则纯文生图，填写后模仿参考图风格） |
+| `cover_image_timeout` | int | 180 | 封面图片生成超时时间（秒） |
 
 ### 群白名单配置示例
 
@@ -258,6 +272,8 @@ AstrBot/data/plugin_data/astrbot_plugin_novel/
 | `/群聊小说 人物 <名字>` | 查看角色详情 |
 | `/群聊小说 阅读 [章节号]` | 阅读指定章节（不填读最新） |
 | `/群聊小说 导出 pdf/epub/txt` | 导出小说文件 |
+| `/群聊小说 封面生成 停止` | 停止每次导出自动重新生成封面 |
+| `/群聊小说 封面生成 开始` | 恢复每次导出自动重新生成封面 |
 | `/群聊小说 关闭预览` | 关闭生成章节后的预览文本 |
 | `/群聊小说 开启预览` | 开启生成章节后的预览文本 |
 
