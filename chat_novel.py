@@ -232,7 +232,7 @@ class ChatNovelEngine:
     # ------------------------------------------------------------------
     # AI 消息质量评估
     # ------------------------------------------------------------------
-    async def evaluate_quality(self, provider) -> tuple[bool, str]:
+    async def evaluate_quality(self, provider, timeout: int = 30) -> tuple[bool, str]:
         """
         评估当前缓冲区的消息质量是否足以生成章节。
         返回 (sufficient: bool, reason: str)。
@@ -255,7 +255,7 @@ class ChatNovelEngine:
         )
 
         try:
-            response = await call_llm(provider, prompt, timeout=30)
+            response = await call_llm(provider, prompt, timeout=timeout)
             result = parse_json_from_response(response)
             if result:
                 sufficient = bool(result.get("sufficient", False))

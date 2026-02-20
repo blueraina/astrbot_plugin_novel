@@ -75,6 +75,11 @@
     "description": "群聊小说生成章节后发送到群聊的预览文本字数上限（0 表示不限制）",
     "default": 800
   },
+  "chat_novel_eval_timeout": {
+    "type": "int",
+    "description": "群聊小说质量评估的大语言模型调用超时时间（秒）",
+    "default": 30
+  },
   "enable_cover_image": {
     "type": "bool",
     "description": "导出 EPUB/PDF 时是否用 AI 生成封面图片（需配置绘图模型）",

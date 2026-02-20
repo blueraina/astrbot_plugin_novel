@@ -1505,7 +1505,8 @@ class NovelPlugin(Star):
                 )
                 provider = self._get_provider_for("writing")
                 try:
-                    sufficient, reason = await ctx.chat_novel.evaluate_quality(provider)
+                    eval_timeout = self._cfg_int("chat_novel_eval_timeout", 30)
+                    sufficient, reason = await ctx.chat_novel.evaluate_quality(provider, timeout=eval_timeout)
                     if not sufficient:
                         yield event.plain_result(
                             f"📊 消息质量评估：有效内容不足（{reason}）\n"
