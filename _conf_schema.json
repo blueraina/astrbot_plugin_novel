@@ -70,6 +70,11 @@
     "description": "群聊小说每多少条消息触发一次章节生成",
     "default": 50
   },
+  "chat_novel_max_word_count": {
+    "type": "int",
+    "description": "群聊小说单章最大字数限制（避免生成过长导致被截断）",
+    "default": 2000
+  },
   "chat_novel_preview_limit": {
     "type": "int",
     "description": "群聊小说生成章节后发送到群聊的预览文本字数上限（0 表示不限制）",

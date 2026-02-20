@@ -1517,7 +1517,8 @@ class NovelPlugin(Star):
                     yield event.plain_result(
                         f"✅ 内容质量充足（{reason}），开始生成新章节，请稍候..."
                     )
-                    chapter = await ctx.chat_novel.generate_chapter(provider)
+                    max_words = self._cfg_int("chat_novel_max_word_count", 2000)
+                    chapter = await ctx.chat_novel.generate_chapter(provider, max_word_count=max_words)
                     if chapter:
                         preview_enabled = ctx.chat_novel.get_preview_enabled()
                         preview_limit = self._cfg_int("chat_novel_preview_limit", 800)

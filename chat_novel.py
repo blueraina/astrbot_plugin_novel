@@ -276,7 +276,7 @@ class ChatNovelEngine:
     # ------------------------------------------------------------------
     # AI 章节生成
     # ------------------------------------------------------------------
-    async def generate_chapter(self, provider) -> Optional[dict]:
+    async def generate_chapter(self, provider, max_word_count: int = 2000) -> Optional[dict]:
         """
         从当前消息缓冲生成新的一章。
         返回生成的章节 dict，失败返回 None。
@@ -348,6 +348,7 @@ class ChatNovelEngine:
             characters_info=chars_info,
             chat_log=chat_log[:6000],
             new_participants=new_participants_text,
+            max_word_count=max_word_count,
         )
 
         try:

@@ -409,7 +409,7 @@ CHAT_NOVEL_GENERATE_CHAPTER_PROMPT = """\
 
 ## 创作要求
 1. 以群友为人物原型，使用他们的小说角色名进行创作
-2. 内容至少 4000 字，越丰富越好
+2. 内容字数请控制在 {max_word_count} 字左右，切勿过长导致内容被截断，但情节要相对充实
 3. 保持与前序章节内容的连贯性
 4. 包含充分的环境描写、人物心理活动、对话互动和动作细节
 5. 对话要生动自然、符合角色性格
@@ -422,7 +422,7 @@ CHAT_NOVEL_GENERATE_CHAPTER_PROMPT = """\
 ```json
 {{
   "chapter_title": "本章标题（简短有吸引力）",
-  "content": "完整的章节正文内容（至少4000字）",
+  "content": "完整的章节正文内容",
   "summary": "本章内容摘要（200字以内）",
   "updated_summary": "更新后的整体故事进展摘要（300字以内）",
   "character_updates": [
