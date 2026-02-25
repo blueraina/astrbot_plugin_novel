@@ -1949,7 +1949,7 @@ class NovelPlugin(Star):
                 "请先让群友们聊天积累素材。"
             )
             return
-        if not ctx.chat_novel.is_initialized():
+        if not ctx.chat_novel._load_novel().get("title"):
             yield event.plain_result(
                 "⚠️ 请先使用 /群聊小说 开始构建 创建小说。"
             )
