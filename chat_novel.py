@@ -25,6 +25,9 @@ from .prompts import (
     CHAT_NOVEL_GENERATE_CHAPTER_PROMPT,
     CHAT_NOVEL_MAP_CHARACTERS_PROMPT,
     CHAT_NOVEL_EVALUATE_QUALITY_PROMPT,
+    CHAT_NOVEL_FILTER_MESSAGES_PROMPT,
+    CHAT_NOVEL_RELATIONSHIP_PROMPT,
+    CHAT_NOVEL_REWRITE_CHAPTER_PROMPT,
 )
 
 
@@ -42,6 +45,8 @@ _DEFAULT_CHAT_NOVEL: dict = {
     "created_at": "",
     "cover_auto_generate": True,  # 导出时是否每次重新生成封面
     "preview_enabled": True,      # 生成章节后是否发送预览文本到群聊
+    "custom_settings": [],        # 用户自定义设定列表
+    "force_ending": False,        # 下一次生成是否强制结局
 }
 
 
@@ -158,7 +163,7 @@ class ChatNovelEngine:
         return novel.get("characters", [])
 
     def _update_characters(self, new_chars: list[dict]) -> None:
-        """更新人物列表（去重合并）"""
+        """更新人物列表（去重合并，跳过已锁定的角色）"""
         novel = self._load_novel()
         existing = novel.get("characters", [])
         existing_ids = {c.get("sender_id") for c in existing}
@@ -168,18 +173,22 @@ class ChatNovelEngine:
             sid = ch.get("sender_id", "")
             rname = ch.get("real_name", "")
             if sid and sid in existing_ids:
-                # 更新已有角色的描述
+                # 更新已有角色的描述（跳过锁定角色）
                 for e in existing:
                     if e.get("sender_id") == sid:
+                        if e.get("locked"):
+                            break  # 锁定角色不允许 AI 修改
                         if ch.get("description"):
                             e["description"] = ch["description"]
                         if ch.get("novel_name"):
                             e["novel_name"] = ch["novel_name"]
                         break
             elif rname and rname in existing_names:
-                # 按真名去重
+                # 按真名去重（跳过锁定角色）
                 for e in existing:
                     if e.get("real_name") == rname:
+                        if e.get("locked"):
+                            break
                         if ch.get("description"):
                             e["description"] = ch["description"]
                         break
@@ -232,9 +241,12 @@ class ChatNovelEngine:
     # ------------------------------------------------------------------
     # AI 消息质量评估
     # ------------------------------------------------------------------
-    async def evaluate_quality(self, provider, timeout: int = 30) -> tuple[bool, str]:
+    async def evaluate_quality(
+        self, provider, timeout: int = 30, quality_threshold: int = 40
+    ) -> tuple[bool, str]:
         """
         评估当前缓冲区的消息质量是否足以生成章节。
+        quality_threshold: 有效消息占比阈值（0-100），低于此值判定为不足。
         返回 (sufficient: bool, reason: str)。
         """
         messages = self._load_messages()
@@ -252,6 +264,7 @@ class ChatNovelEngine:
         prompt = CHAT_NOVEL_EVALUATE_QUALITY_PROMPT.format(
             message_count=len(messages),
             chat_log=chat_log[:4000],
+            quality_threshold=quality_threshold,
         )
 
         try:
@@ -274,9 +287,71 @@ class ChatNovelEngine:
             return True, f"评估异常: {e}"
 
     # ------------------------------------------------------------------
+    # AI 消息过滤（小模型）
+    # ------------------------------------------------------------------
+    async def filter_messages(
+        self, provider, timeout: int = 60
+    ) -> tuple[int, int]:
+        """
+        使用小模型过滤无用消息，只保留有效消息。
+        返回 (原始消息数, 保留消息数)。
+        """
+        messages = self._load_messages()
+        if not messages:
+            return 0, 0
+
+        original_count = len(messages)
+
+        # 格式化带序号的聊天记录
+        chat_log_lines = []
+        for i, msg in enumerate(messages):
+            name = msg.get("sender_name", "未知")
+            content = msg.get("content", "")
+            chat_log_lines.append(f"[{i}] [{name}]: {content}")
+        chat_log = "\n".join(chat_log_lines)
+
+        prompt = CHAT_NOVEL_FILTER_MESSAGES_PROMPT.format(
+            message_count=original_count,
+            chat_log=chat_log[:6000],
+        )
+
+        try:
+            response = await call_llm(provider, prompt, timeout=timeout)
+            result = parse_json_from_response(response)
+            if result and "keep_indices" in result:
+                keep_indices = set(result["keep_indices"])
+                filtered = [
+                    msg for i, msg in enumerate(messages)
+                    if i in keep_indices
+                ]
+                if filtered:  # 防止全部被过滤
+                    self._save_messages(filtered)
+                    kept = len(filtered)
+                    logger.info(
+                        f"[{PLUGIN_ID}] 群聊小说消息过滤完成："
+                        f"{original_count} → {kept}"
+                    )
+                    return original_count, kept
+                else:
+                    logger.warning(
+                        f"[{PLUGIN_ID}] 过滤后无消息保留，保持原样"
+                    )
+                    return original_count, original_count
+            else:
+                logger.warning(
+                    f"[{PLUGIN_ID}] 消息过滤结果解析失败，保持原样"
+                )
+                return original_count, original_count
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_ID}] 群聊小说消息过滤异常: {e}")
+            return original_count, original_count
+
+    # ------------------------------------------------------------------
     # AI 章节生成
     # ------------------------------------------------------------------
-    async def generate_chapter(self, provider, max_word_count: int = 2000) -> Optional[dict]:
+    async def generate_chapter(
+        self, provider, max_word_count: int = 2000, force_ending: bool = False
+    ) -> Optional[dict]:
         """
         从当前消息缓冲生成新的一章。
         返回生成的章节 dict，失败返回 None。
@@ -339,6 +414,16 @@ class ChatNovelEngine:
                 logger.warning(f"[{PLUGIN_ID}] 群聊小说角色映射失败: {e}")
 
         # 2. 生成章节
+        # 构建结局指令（如有）
+        ending_instruction = ""
+        if force_ending:
+            ending_instruction = (
+                "\n## ⚠️ 重要：强制结局要求\n"
+                "这是本小说的**最后一章**，你必须在本章中为整个故事写出一个完整的结局。\n"
+                "要求：总结所有主要角色的命运、解决悬而未决的情节线、给出明确的故事结尾。\n"
+                "结尾要有仪式感，让读者感受到故事的圆满收束。\n\n"
+            )
+
         prompt = CHAT_NOVEL_GENERATE_CHAPTER_PROMPT.format(
             novel_title=novel.get("title", "群聊物语"),
             chapter_number=chapter_number,
@@ -349,6 +434,7 @@ class ChatNovelEngine:
             chat_log=chat_log[:6000],
             new_participants=new_participants_text,
             max_word_count=max_word_count,
+            ending_instruction=ending_instruction,
         )
 
         try:
@@ -382,12 +468,14 @@ class ChatNovelEngine:
                     novel.get("global_summary", "") + " " + chapter["summary"]
                 )[-500:]
 
-            # 更新角色信息（如果 AI 返回了额外的角色信息）
+            # 更新角色信息（如果 AI 返回了额外的角色信息，跳过锁定角色）
             if result and result.get("character_updates"):
                 for cu in result["character_updates"]:
                     rname = cu.get("real_name", "")
                     for c in novel.get("characters", []):
                         if c.get("real_name") == rname or c.get("novel_name") == cu.get("novel_name", ""):
+                            if c.get("locked"):
+                                break  # 锁定角色不允许 AI 修改
                             if cu.get("description"):
                                 c["description"] = cu["description"]
                             break
@@ -396,6 +484,13 @@ class ChatNovelEngine:
 
             # 清空消息缓冲
             self._save_messages([])
+
+            # 强制结局：生成完成后停止收集并重置标记
+            if force_ending:
+                novel["force_ending"] = False
+                novel["status"] = "stopped"
+                self._save_novel(novel)
+                logger.info(f"[{PLUGIN_ID}] 群聊小说强制结局完成，已停止收集")
 
             logger.info(
                 f"[{PLUGIN_ID}] 群聊小说第{chapter_number}章生成完成："
@@ -447,6 +542,209 @@ class ChatNovelEngine:
             logger.info(f"[{PLUGIN_ID}] 群聊小说角色映射完成：{[c['real_name'] for c in mapped]}")
 
     # ------------------------------------------------------------------
+    # 用户自定义设定
+    # ------------------------------------------------------------------
+    def add_custom_setting(self, content: str) -> int:
+        """添加用户自定义设定，返回当前设定总数"""
+        novel = self._load_novel()
+        settings = novel.get("custom_settings", [])
+        settings.append({
+            "content": content,
+            "added_at": datetime.now().isoformat(),
+        })
+        novel["custom_settings"] = settings
+        self._save_novel(novel)
+        logger.info(f"[{PLUGIN_ID}] 群聊小说添加自定义设定：{content[:50]}")
+        return len(settings)
+
+    def get_custom_settings(self) -> list:
+        """获取所有自定义设定"""
+        novel = self._load_novel()
+        return novel.get("custom_settings", [])
+
+    # ------------------------------------------------------------------
+    # 强制结局
+    # ------------------------------------------------------------------
+    def set_force_ending(self, val: bool) -> None:
+        """设置是否在下一次生成时强制结局"""
+        novel = self._load_novel()
+        novel["force_ending"] = val
+        self._save_novel(novel)
+
+    def get_force_ending(self) -> bool:
+        """获取是否需要强制结局"""
+        novel = self._load_novel()
+        return novel.get("force_ending", False)
+
+    # ------------------------------------------------------------------
+    # 角色编辑 & 锁定
+    # ------------------------------------------------------------------
+    def update_character_desc(self, name: str, new_desc: str) -> Optional[dict]:
+        """通过真名或小说名修改角色描述，返回修改后的角色或 None"""
+        novel = self._load_novel()
+        for c in novel.get("characters", []):
+            if c.get("real_name") == name or c.get("novel_name") == name:
+                c["description"] = new_desc
+                self._save_novel(novel)
+                return c
+        return None
+
+    def toggle_character_lock(self, name: str) -> Optional[tuple[dict, bool]]:
+        """
+        切换角色的锁定状态。
+        返回 (角色dict, 新的锁定状态) 或 None（角色不存在）。
+        """
+        novel = self._load_novel()
+        for c in novel.get("characters", []):
+            if c.get("real_name") == name or c.get("novel_name") == name:
+                new_locked = not c.get("locked", False)
+                c["locked"] = new_locked
+                self._save_novel(novel)
+                return c, new_locked
+        return None
+
+
+    # ------------------------------------------------------------------
+    # 角色关系图
+    # ------------------------------------------------------------------
+    async def generate_relationship_graph(self, provider) -> Optional[dict]:
+        """AI 生成角色关系 Mermaid 代码"""
+        novel = self._load_novel()
+        chars = novel.get("characters", [])
+        chapters = novel.get("chapters", [])
+        if not chars or not chapters:
+            return None
+
+        chars_info = "\n".join([
+            f"- {c.get('novel_name', '?')}（原型：{c.get('real_name', '?')}）：{c.get('description', '暂无')}"
+            for c in chars
+        ])
+
+        chapters_summary = "\n".join([
+            f"第{ch['number']}章「{ch.get('title', '')}」：{ch.get('summary', truncate_text(ch.get('content', ''), 200))}"
+            for ch in chapters
+        ])
+
+        prompt = CHAT_NOVEL_RELATIONSHIP_PROMPT.format(
+            characters_info=chars_info,
+            chapters_summary=chapters_summary[:4000],
+        )
+
+        try:
+            response = await call_llm(provider, prompt, timeout=120)
+            result = parse_json_from_response(response)
+            if result and "mermaid_code" in result:
+                code = result["mermaid_code"]
+                # 移除 AI 可能生成的 %%{init}%% 指令（主题由 URL 参数控制）
+                import re as _re_local
+                code = _re_local.sub(r'%%\{init:.*?\}%%\s*', '', code)
+                # 确保有 linkStyle 让连线清晰可见（粗线 + 深色）
+                if "linkStyle" not in code:
+                    code += "\n    linkStyle default stroke:#333,stroke-width:3px"
+                else:
+                    # 替换已有的 linkStyle 让线条更粗
+                    code = _re_local.sub(
+                        r'linkStyle\s+default\s+stroke:[^,]+,stroke-width:\d+px',
+                        'linkStyle default stroke:#333,stroke-width:3px',
+                        code,
+                    )
+                result["mermaid_code"] = code
+            return result
+        except Exception as e:
+            logger.error(f"[{PLUGIN_ID}] 关系图生成失败: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # 章节重写
+    # ------------------------------------------------------------------
+    async def rewrite_chapter(
+        self, provider, chapter_number: int,
+        instructions: str = "", max_word_count: int = 2000
+    ) -> Optional[dict]:
+        """重写指定章节，返回新章节 dict 或 None"""
+        novel = self._load_novel()
+        chapters = novel.get("chapters", [])
+
+        # 查找目标章节
+        target_idx = None
+        target_ch = None
+        for i, ch in enumerate(chapters):
+            if ch.get("number") == chapter_number:
+                target_idx = i
+                target_ch = ch
+                break
+        if target_ch is None:
+            return None
+
+        # 角色信息
+        chars = novel.get("characters", [])
+        chars_info = "\n".join([
+            f"- {c.get('real_name', '?')} → {c.get('novel_name', '?')}：{c.get('description', '暂无')}"
+            for c in chars
+        ]) if chars else "暂无角色"
+
+        # 前序章节
+        previous_chapters = ""
+        for ch in chapters[:target_idx]:
+            previous_chapters += f"第{ch['number']}章「{ch.get('title', '')}」：{ch.get('summary', '无摘要')}\n"
+        if not previous_chapters:
+            previous_chapters = "这是第一章，没有前序章节。"
+
+        # 后续章节
+        next_chapters = ""
+        for ch in chapters[target_idx + 1:]:
+            next_chapters += f"第{ch['number']}章「{ch.get('title', '')}」：{ch.get('summary', '无摘要')}\n"
+        if not next_chapters:
+            next_chapters = "这是最新章节，没有后续章节。"
+
+        prompt = CHAT_NOVEL_REWRITE_CHAPTER_PROMPT.format(
+            novel_title=novel.get("title", "群聊物语"),
+            chapter_number=chapter_number,
+            requirements=novel.get("requirements", "无特殊要求"),
+            global_summary=novel.get("global_summary", "故事尚未开始"),
+            previous_chapters=previous_chapters,
+            next_chapters=next_chapters,
+            characters_info=chars_info,
+            original_content=truncate_text(target_ch.get("content", ""), 4000),
+            user_instructions=instructions or "请保持原有风格，优化内容质量",
+            max_word_count=max_word_count,
+        )
+
+        try:
+            response = await call_llm(provider, prompt, timeout=240)
+            result = parse_json_from_response(response)
+
+            if not result:
+                new_chapter = {
+                    "number": chapter_number,
+                    "title": target_ch.get("title", f"第{chapter_number}章"),
+                    "content": response.strip(),
+                    "summary": response.strip()[:200],
+                }
+            else:
+                new_chapter = {
+                    "number": chapter_number,
+                    "title": result.get("chapter_title", target_ch.get("title", f"第{chapter_number}章")),
+                    "content": result.get("content", response.strip()),
+                    "summary": result.get("summary", ""),
+                }
+
+            # 替换原章节
+            chapters[target_idx] = new_chapter
+            novel["chapters"] = chapters
+            self._save_novel(novel)
+
+            logger.info(
+                f"[{PLUGIN_ID}] 群聊小说第{chapter_number}章重写完成："
+                f"{new_chapter['title']}（{len(new_chapter.get('content', ''))}字）"
+            )
+            return new_chapter
+
+        except Exception as e:
+            logger.error(f"[{PLUGIN_ID}] 群聊小说章节重写失败: {e}")
+            return None
+
+    # ------------------------------------------------------------------
     # 数据管理
     # ------------------------------------------------------------------
     @staticmethod
@@ -466,10 +764,17 @@ class ChatNovelEngine:
     def get_novel_data(self) -> dict:
         """获取小说数据（用于导出）"""
         novel = self._load_novel()
-        # 构建简介：风格要求 + 剧情简介（分开展示）
+        # 构建简介：风格要求 + 自定义设定 + 剧情简介（分开展示）
         synopsis_parts = []
         if novel.get("requirements"):
             synopsis_parts.append(f"风格：{novel['requirements']}")
+        # 添加用户自定义设定
+        custom_settings = novel.get("custom_settings", [])
+        if custom_settings:
+            synopsis_parts.append("")
+            synopsis_parts.append("用户设定：")
+            for i, s in enumerate(custom_settings, 1):
+                synopsis_parts.append(f"  {i}. {s.get('content', '')}")
         if novel.get("global_summary") and novel["global_summary"] != "故事尚未开始。":
             synopsis_parts.append(f"\n剧情简介：{novel['global_summary']}")
         synopsis = "\n".join(synopsis_parts)
@@ -498,9 +803,39 @@ class ChatNovelEngine:
         """导出全文文本"""
         novel = self._load_novel()
         lines = [f"《{novel.get('title', '群聊物语')}》", ""]
-        if novel.get("requirements"):
-            lines.append(f"【主题】{novel['requirements']}")
+
+        # 出场人物
+        characters = novel.get("characters", [])
+        if characters:
+            lines.append("【出场人物】")
+            for char in characters:
+                novel_name = char.get("novel_name", "")
+                real_name = char.get("real_name", "")
+                desc = char.get("description", "")
+                if novel_name and real_name:
+                    lines.append(f"  {novel_name}（{real_name}）：{desc}")
+                elif novel_name:
+                    lines.append(f"  {novel_name}：{desc}")
             lines.append("")
+
+        # 简介（主题 + 自定义设定 + 剧情简介）
+        synopsis_parts = []
+        if novel.get("requirements"):
+            synopsis_parts.append(f"风格：{novel['requirements']}")
+        custom_settings = novel.get("custom_settings", [])
+        if custom_settings:
+            synopsis_parts.append("")
+            synopsis_parts.append("用户设定：")
+            for i, s in enumerate(custom_settings, 1):
+                synopsis_parts.append(f"  {i}. {s.get('content', '')}")
+        if novel.get("global_summary") and novel["global_summary"] != "故事尚未开始。":
+            synopsis_parts.append(f"")
+            synopsis_parts.append(f"剧情简介：{novel['global_summary']}")
+        if synopsis_parts:
+            lines.append("【简介】")
+            lines.extend(synopsis_parts)
+            lines.append("")
+
         for ch in novel.get("chapters", []):
             clean_title = self._strip_chapter_prefix(ch.get('title', ''))
             lines.append(f"第{ch.get('number', '?')}章 {clean_title}")

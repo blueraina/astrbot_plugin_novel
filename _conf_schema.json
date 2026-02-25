@@ -120,5 +120,21 @@
     "type": "int",
     "description": "封面图片生成超时时间（秒），生图模型较慢时可适当增大",
     "default": 180
+  },
+  "chat_novel_quality_threshold": {
+    "type": "int",
+    "description": "群聊小说质量评估中有效消息占比阈值（0-100），低于此值判定为内容不足",
+    "default": 40
+  },
+  "chat_novel_filter_enabled": {
+    "type": "bool",
+    "description": "群聊小说内容不足时是否启用小模型过滤无用消息（过滤后仅保留有效消息继续收集）",
+    "default": false
+  },
+  "chat_novel_filter_provider": {
+    "type": "string",
+    "description": "群聊小说消息过滤使用的小模型（留空则使用全局默认模型，建议选择轻量模型以节省成本）",
+    "default": "",
+    "_special": "select_provider"
   }
 }

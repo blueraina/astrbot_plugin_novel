@@ -368,3 +368,52 @@ async def _call_images_generate(client, prompt: str, size: str, model_name: str 
         return result
 
     raise AttributeError("client 不支持 images.generate()")
+
+
+# =====================================================================
+# Mermaid 图表渲染为图片
+# =====================================================================
+
+async def render_mermaid_to_image(
+    mermaid_code: str, output_path: Path, timeout: int = 30
+) -> Optional[Path]:
+    """
+    使用 mermaid.ink API 将 Mermaid 代码渲染为 PNG 图片。
+    返回图片路径，失败返回 None。
+    """
+    import base64
+    import urllib.request
+    import urllib.error
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # mermaid.ink API: base64 编码的 mermaid 代码
+        encoded = base64.urlsafe_b64encode(
+            mermaid_code.encode("utf-8")
+        ).decode("ascii")
+        url = f"https://mermaid.ink/img/{encoded}?type=png&bgColor=!white&theme=neutral"
+
+        # 使用 asyncio 在线程中运行同步下载
+        loop = asyncio.get_event_loop()
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "AstrBot-Novel-Plugin/1.0")
+
+        def _download():
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+
+        data = await loop.run_in_executor(None, _download)
+
+        if data and len(data) > 100:  # 确保不是空响应
+            output_path.write_bytes(data)
+            logger.info(f"[{PLUGIN_ID}] Mermaid 图表渲染完成：{output_path}")
+            return output_path
+        else:
+            logger.warning(f"[{PLUGIN_ID}] Mermaid 渲染返回数据过小")
+            return None
+
+    except Exception as e:
+        logger.error(f"[{PLUGIN_ID}] Mermaid 图表渲染失败: {e}")
+        return None
+

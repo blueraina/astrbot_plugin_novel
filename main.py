@@ -27,7 +27,7 @@ try:
 except Exception:  # pragma: no cover
     AstrBotConfig = Any  # type: ignore
 
-from .utils import PLUGIN_ID, truncate_text, generate_cover_image
+from .utils import PLUGIN_ID, truncate_text, generate_cover_image, render_mermaid_to_image
 from .knowledge_base import KnowledgeBase
 from .idea_manager import IdeaManager
 from .novel_engine import NovelEngine
@@ -1506,19 +1506,51 @@ class NovelPlugin(Star):
                 provider = self._get_provider_for("writing")
                 try:
                     eval_timeout = self._cfg_int("chat_novel_eval_timeout", 30)
-                    sufficient, reason = await ctx.chat_novel.evaluate_quality(provider, timeout=eval_timeout)
+                    quality_threshold = self._cfg_int("chat_novel_quality_threshold", 40)
+                    sufficient, reason = await ctx.chat_novel.evaluate_quality(
+                        provider, timeout=eval_timeout,
+                        quality_threshold=quality_threshold,
+                    )
                     if not sufficient:
-                        yield event.plain_result(
-                            f"📊 消息质量评估：有效内容不足（{reason}）\n"
-                            f"📡 将继续收集，攒够下一轮 {threshold} 条后再次判断。"
-                        )
+                        # 尝试用小模型过滤无用消息
+                        filter_enabled = self._cfg_bool("chat_novel_filter_enabled", False)
+                        if filter_enabled:
+                            filter_provider = self._get_provider_for("chat_novel_filter")
+                            yield event.plain_result(
+                                f"📊 消息质量评估：有效内容不足（{reason}）\n"
+                                f"🔍 正在使用小模型过滤无用消息..."
+                            )
+                            try:
+                                orig, kept = await ctx.chat_novel.filter_messages(
+                                    filter_provider, timeout=eval_timeout
+                                )
+                                yield event.plain_result(
+                                    f"✅ 消息过滤完成：{orig} 条 → {kept} 条有效消息\n"
+                                    f"📡 将继续收集，攒够下一轮 {threshold} 条后再次判断。"
+                                )
+                            except Exception as fe:
+                                logger.warning(f"[{PLUGIN_ID}] 消息过滤失败: {fe}")
+                                yield event.plain_result(
+                                    f"📊 消息质量评估：有效内容不足（{reason}）\n"
+                                    f"⚠️ 消息过滤失败，将继续收集。"
+                                )
+                        else:
+                            yield event.plain_result(
+                                f"📊 消息质量评估：有效内容不足（{reason}）\n"
+                                f"📡 将继续收集，攒够下一轮 {threshold} 条后再次判断。"
+                            )
                         return
 
                     yield event.plain_result(
                         f"✅ 内容质量充足（{reason}），开始生成新章节，请稍候..."
                     )
                     max_words = self._cfg_int("chat_novel_max_word_count", 2000)
-                    chapter = await ctx.chat_novel.generate_chapter(provider, max_word_count=max_words)
+                    # 检查是否有强制结局标记
+                    is_force_ending = ctx.chat_novel.get_force_ending()
+                    chapter = await ctx.chat_novel.generate_chapter(
+                        provider, max_word_count=max_words,
+                        force_ending=is_force_ending,
+                    )
                     if chapter:
                         preview_enabled = ctx.chat_novel.get_preview_enabled()
                         preview_limit = self._cfg_int("chat_novel_preview_limit", 800)
@@ -1547,6 +1579,15 @@ class NovelPlugin(Star):
                             )
                     else:
                         yield event.plain_result("⚠️ 群聊小说章节生成失败，请稍后重试。")
+
+                    # 强制结局通知
+                    if is_force_ending and chapter:
+                        yield event.plain_result(
+                            "🎬 群聊小说已强制结局！故事圆满收束。\n"
+                            "📡 消息收集已自动停止。\n"
+                            "💾 使用 /群聊小说 导出 pdf 可导出完整小说。\n"
+                            "🔄 如需开启新故事，请使用 /群聊小说 开始构建"
+                        )
                 except Exception as e:
                     logger.error(f"[{PLUGIN_ID}] 群聊小说章节生成异常: {e}")
                     yield event.plain_result(f"⚠️ 群聊小说章节生成出错：{e}")
@@ -1562,8 +1603,15 @@ class NovelPlugin(Star):
 ▸ /群聊小说 停止          停止收集
 ▸ /群聊小说 继续          继续收集（从停止状态恢复）
 ▸ /群聊小说 状态          查看进度
+▸ /群聊小说 设定 <内容>    添加自定义设定（显示在简介中）
+▸ /群聊小说 结局          下一次生成强制结局并停止收集
+▸ /群聊小说 立即生成       跳过阈值立即生成章节
+▸ /群聊小说 重写 <章节号> <说明>  重写指定章节
 ▸ /群聊小说 人物列表       查看角色
 ▸ /群聊小说 人物 <名字>    角色详情
+▸ /群聊小说 修改角色 <名字> <新描述>  修改角色设定
+▸ /群聊小说 锁定角色 <名字>  锁定/解锁角色设定
+▸ /群聊小说 关系图        生成角色关系图片
 ▸ /群聊小说 阅读 [章节号]   阅读章节
 ▸ /群聊小说 导出 pdf/epub/txt  导出小说
 ▸ /群聊小说 封面生成 停止   停止每次导出重新生成封面
@@ -1826,6 +1874,334 @@ class NovelPlugin(Star):
             f"📝 消息缓冲已清空\n\n"
             f"如需重新开始，请使用 /群聊小说 开始构建 <要求>"
         )
+
+    @chat_novel_cmd.command("设定", alias={"setting"})
+    async def cn_setting(self, event: AstrMessageEvent, text: str = ""):
+        """添加自定义设定"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+        # 从原始消息提取内容
+        content = text.strip()
+        if not content:
+            raw_msg = (event.message_str or "").strip()
+            for prefix in ["/群聊小说 设定 ", "/群聊小说 setting ",
+                           "群聊小说 设定 ", "群聊小说 setting "]:
+                idx = raw_msg.find(prefix)
+                if idx >= 0:
+                    content = raw_msg[idx + len(prefix):].strip()
+                    break
+        if not content:
+            yield event.plain_result(
+                "用法：/群聊小说 设定 <内容>\n"
+                "添加的设定会显示在导出小说的简介中。"
+            )
+            return
+        count = ctx.chat_novel.add_custom_setting(content)
+        yield event.plain_result(
+            f"✅ 自定义设定已添加！（当前共 {count} 条设定）\n"
+            f"📝 内容：{content}\n"
+            f"该设定将显示在导出小说的简介中。"
+        )
+
+    @chat_novel_cmd.command("结局", alias={"ending"})
+    async def cn_ending(self, event: AstrMessageEvent):
+        """标记下一次生成强制结局"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+        if not ctx.chat_novel.is_collecting():
+            yield event.plain_result(
+                "⚠️ 群聊小说当前未在收集中。\n"
+                "请先使用 /群聊小说 开始构建 开始收集。"
+            )
+            return
+        ctx.chat_novel.set_force_ending(True)
+        pending = ctx.chat_novel.get_pending_count()
+        threshold = self._cfg_int("chat_novel_threshold", 50)
+        yield event.plain_result(
+            "🎬 已标记强制结局！\n"
+            f"📝 当前待处理消息 {pending} 条（每 {threshold} 条触发生成）\n"
+            f"下一次生成的章节将作为最终章，AI 会为故事写一个完整的结局。\n"
+            f"生成完成后将自动停止收集。\n"
+            f"群友们继续聊天即可，或等待消息攒够后自动触发。"
+        )
+
+    @chat_novel_cmd.command("立即生成", alias={"generate", "now"})
+    async def cn_generate_now(self, event: AstrMessageEvent):
+        """立即生成章节，不等待消息数达到阈值"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+        pending = ctx.chat_novel.get_pending_count()
+        if pending == 0:
+            yield event.plain_result(
+                "⚠️ 当前没有待处理的消息。\n"
+                "请先让群友们聊天积累素材。"
+            )
+            return
+        if not ctx.chat_novel.is_initialized():
+            yield event.plain_result(
+                "⚠️ 请先使用 /群聊小说 开始构建 创建小说。"
+            )
+            return
+
+        yield event.plain_result(
+            f"✅ 当前有 {pending} 条消息，跳过阈值检查，立即生成章节中..."
+        )
+
+        provider = self._get_provider_for("writing")
+        max_words = self._cfg_int("chat_novel_max_word_count", 2000)
+        is_force_ending = ctx.chat_novel.get_force_ending()
+
+        try:
+            chapter = await ctx.chat_novel.generate_chapter(
+                provider, max_word_count=max_words,
+                force_ending=is_force_ending,
+            )
+            if chapter:
+                content = chapter.get("content", "")
+                preview_limit = self._cfg_int("chat_novel_preview_limit", 800)
+                preview_enabled = ctx.chat_novel.get_preview_enabled()
+                if preview_enabled and content:
+                    if preview_limit > 0:
+                        content_preview = content[:preview_limit]
+                        truncated = len(content) > preview_limit
+                    else:
+                        content_preview = content
+                        truncated = False
+                    yield event.plain_result(
+                        f"📖 群聊小说 第{chapter['number']}章「{chapter['title']}」已完成！\n\n"
+                        f"{content_preview}\n\n"
+                        f"{'...(内容过长已截断)' if truncated else ''}\n"
+                        f"📚 共 {len(content)} 字\n"
+                        f"💾 使用 /群聊小说 阅读 {chapter['number']} 查看全文"
+                    )
+                else:
+                    yield event.plain_result(
+                        f"📖 群聊小说 第{chapter['number']}章「{chapter['title']}」已完成！\n"
+                        f"📚 共 {len(content)} 字\n"
+                        f"💾 使用 /群聊小说 阅读 {chapter['number']} 查看全文"
+                    )
+                if is_force_ending:
+                    yield event.plain_result(
+                        "🎬 群聊小说已强制结局！故事圆满收束。\n"
+                        "💾 使用 /群聊小说 导出 pdf 可导出完整小说。"
+                    )
+            else:
+                yield event.plain_result("⚠️ 章节生成失败，请稍后重试。")
+        except Exception as e:
+            logger.error(f"[{PLUGIN_ID}] 立即生成异常: {e}")
+            yield event.plain_result(f"⚠️ 生成失败：{e}")
+
+    @chat_novel_cmd.command("重写", alias={"rewrite"})
+    async def cn_rewrite(self, event: AstrMessageEvent, text: str = ""):
+        """重写指定章节"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+        chapters = ctx.chat_novel.get_chapters()
+        if not chapters:
+            yield event.plain_result("暂无章节可重写。")
+            return
+
+        parts = text.strip().split(None, 1)
+        if not parts:
+            yield event.plain_result(
+                "用法：/群聊小说 重写 <章节号> [补充说明]\n"
+                "示例：/群聊小说 重写 2 请增加更多战斗场景"
+            )
+            return
+
+        try:
+            ch_num = int(parts[0])
+        except ValueError:
+            yield event.plain_result("章节号必须是数字。")
+            return
+
+        instructions = parts[1] if len(parts) > 1 else ""
+
+        # 检查章节是否存在
+        found = any(ch.get("number") == ch_num for ch in chapters)
+        if not found:
+            yield event.plain_result(
+                f"未找到第 {ch_num} 章。\n"
+                f"当前共有 {len(chapters)} 章，可重写范围：1-{len(chapters)}"
+            )
+            return
+
+        yield event.plain_result(
+            f"✏️ 正在重写第 {ch_num} 章，请稍候..."
+        )
+
+        provider = self._get_provider_for("writing")
+        max_words = self._cfg_int("chat_novel_max_word_count", 2000)
+        try:
+            new_ch = await ctx.chat_novel.rewrite_chapter(
+                provider, ch_num, instructions, max_words
+            )
+            if new_ch:
+                content = new_ch.get("content", "")
+                yield event.plain_result(
+                    f"✅ 第{ch_num}章「{new_ch['title']}」重写完成！\n"
+                    f"📚 共 {len(content)} 字\n"
+                    f"💾 使用 /群聊小说 阅读 {ch_num} 查看新内容"
+                )
+            else:
+                yield event.plain_result("⚠️ 章节重写失败，请稍后重试。")
+        except Exception as e:
+            logger.error(f"[{PLUGIN_ID}] 章节重写异常: {e}")
+            yield event.plain_result(f"⚠️ 重写失败：{e}")
+
+
+    @chat_novel_cmd.command("关系图", alias={"relationship", "graph"})
+    async def cn_relationship(self, event: AstrMessageEvent):
+        """生成角色关系图图片"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+        chapters = ctx.chat_novel.get_chapters()
+        chars = ctx.chat_novel.list_characters()
+        if not chapters or not chars:
+            yield event.plain_result("暂无足够数据生成关系图（需要至少 1 章和 1 个角色）。")
+            return
+
+        yield event.plain_result("🔗 正在分析角色关系并生成图片，请稍候...")
+
+        provider = self._get_provider_for("writing")
+        try:
+            result = await ctx.chat_novel.generate_relationship_graph(provider)
+            if not result or "mermaid_code" not in result:
+                yield event.plain_result("⚠️ 关系图生成失败，请稍后重试。")
+                return
+
+            mermaid_code = result["mermaid_code"]
+            description = result.get("description", "")
+
+            # 渲染为图片
+            export_dir = ctx.data_dir / "exports"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            img_path = export_dir / "relationship_graph.png"
+
+            rendered = await render_mermaid_to_image(mermaid_code, img_path)
+            if rendered and rendered.exists():
+                # 发送文字描述
+                if description:
+                    yield event.plain_result(
+                        f"🔗 角色关系图\n\n{description}"
+                    )
+                # 发送图片文件
+                if FileComp:
+                    try:
+                        yield event.chain_result([
+                            FileComp(name="relationship_graph.png",
+                                     url=f"file://{rendered}")
+                        ])
+                    except Exception as fe:
+                        logger.warning(f"[{PLUGIN_ID}] 关系图发送失败: {fe}")
+                        yield event.plain_result(
+                            f"📁 图片已保存：{rendered}\n"
+                            f"发送失败，请手动查看。"
+                        )
+                else:
+                    yield event.plain_result(f"📁 图片已保存：{rendered}")
+            else:
+                # 图片渲染失败，输出 Mermaid 源码
+                yield event.plain_result(
+                    f"⚠️ 图片渲染失败，输出 Mermaid 源码：\n\n"
+                    f"```mermaid\n{mermaid_code}\n```\n\n"
+                    f"{description}"
+                )
+        except Exception as e:
+            logger.error(f"[{PLUGIN_ID}] 关系图异常: {e}")
+            yield event.plain_result(f"⚠️ 关系图生成失败：{e}")
+
+    @chat_novel_cmd.command("修改角色", alias={"editchar"})
+    async def cn_edit_char(self, event: AstrMessageEvent, text: str = ""):
+        """修改角色描述"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+
+        parts = text.strip().split(None, 1)
+        if len(parts) < 2:
+            yield event.plain_result(
+                "用法：/群聊小说 修改角色 <名字> <新描述>\n"
+                "名字可以是角色的小说名或群昵称。"
+            )
+            return
+
+        name, new_desc = parts[0], parts[1]
+        updated = ctx.chat_novel.update_character_desc(name, new_desc)
+        if updated:
+            locked_tag = " 🔒" if updated.get("locked") else ""
+            yield event.plain_result(
+                f"✅ 角色「{updated.get('novel_name', '?')}」设定已更新！{locked_tag}\n"
+                f"👤 群昵称：{updated.get('real_name', '?')}\n"
+                f"📝 新描述：{new_desc}"
+            )
+        else:
+            yield event.plain_result(
+                f"未找到角色「{name}」。\n"
+                f"使用 /群聊小说 人物列表 查看所有角色。"
+            )
+
+    @chat_novel_cmd.command("锁定角色", alias={"lockchar"})
+    async def cn_lock_char(self, event: AstrMessageEvent, text: str = ""):
+        """锁定/解锁角色设定"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+
+        name = text.strip()
+        if not name:
+            yield event.plain_result(
+                "用法：/群聊小说 锁定角色 <名字>\n"
+                "锁定后 AI 不会自动修改该角色的设定。\n"
+                "再次执行即可解锁。"
+            )
+            return
+
+        result = ctx.chat_novel.toggle_character_lock(name)
+        if result:
+            char, is_locked = result
+            status = "🔒 已锁定" if is_locked else "🔓 已解锁"
+            desc = (
+                "AI 将不会自动修改该角色的设定。"
+                if is_locked else
+                "AI 可以根据情节自动更新该角色。"
+            )
+            yield event.plain_result(
+                f"{status} 角色「{char.get('novel_name', '?')}」\n"
+                f"👤 群昵称：{char.get('real_name', '?')}\n"
+                f"{desc}"
+            )
+        else:
+            yield event.plain_result(
+                f"未找到角色「{name}」。\n"
+                f"使用 /群聊小说 人物列表 查看所有角色。"
+            )
 
     @chat_novel_cmd.command("封面生成")
     async def cn_cover_toggle(self, event: AstrMessageEvent, action: str = ""):
