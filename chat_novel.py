@@ -1,4 +1,4 @@
-"""
+﻿"""
 群聊小说引擎 — 基于群聊消息自动生成小说
 与现有的小说功能完全独立，每个群独立运行。
 """
@@ -22,12 +22,14 @@ from .utils import (
     truncate_text,
 )
 from .prompts import (
-    CHAT_NOVEL_GENERATE_CHAPTER_PROMPT,
+    CHAT_NOVEL_GENERATE_CHAPTER_TEXT_PROMPT,
+    CHAT_NOVEL_EXTRACT_CHAPTER_METADATA_PROMPT,
     CHAT_NOVEL_MAP_CHARACTERS_PROMPT,
     CHAT_NOVEL_EVALUATE_QUALITY_PROMPT,
     CHAT_NOVEL_FILTER_MESSAGES_PROMPT,
     CHAT_NOVEL_RELATIONSHIP_PROMPT,
     CHAT_NOVEL_REWRITE_CHAPTER_PROMPT,
+    CHAT_NOVEL_PLOT_CHECK_PROMPT,
 )
 
 
@@ -47,7 +49,18 @@ _DEFAULT_CHAT_NOVEL: dict = {
     "preview_enabled": True,      # 生成章节后是否发送预览文本到群聊
     "custom_settings": [],        # 用户自定义设定列表
     "force_ending": False,        # 下一次生成是否强制结局
+    "next_plot_direction": "",    # 下一次生成章节的临时剧情走向
+    "story_bible": {},            # HCA 式高压缩故事档案
+    "memory_entries": [],         # CSA 式可召回历史记忆块
 }
+
+
+_MAX_MEMORY_ENTRIES = 300
+
+
+def _fresh_default_chat_novel() -> dict:
+    """返回不共享可变对象的默认群聊小说数据。"""
+    return _json.loads(_json.dumps(_DEFAULT_CHAT_NOVEL, ensure_ascii=False))
 
 
 class ChatNovelEngine:
@@ -62,7 +75,14 @@ class ChatNovelEngine:
     # 状态管理
     # ------------------------------------------------------------------
     def _load_novel(self) -> dict:
-        return safe_json_load(self._novel_path, dict(_DEFAULT_CHAT_NOVEL))
+        novel = safe_json_load(self._novel_path, _fresh_default_chat_novel())
+        if not isinstance(novel, dict):
+            return _fresh_default_chat_novel()
+        defaults = _fresh_default_chat_novel()
+        for key, value in defaults.items():
+            if key not in novel:
+                novel[key] = value
+        return novel
 
     def _save_novel(self, data: dict) -> None:
         safe_json_save(self._novel_path, data)
@@ -115,18 +135,28 @@ class ChatNovelEngine:
     # ------------------------------------------------------------------
     # 消息收集
     # ------------------------------------------------------------------
-    def add_message(self, sender_name: str, sender_id: str, content: str) -> int:
+    def add_message(
+        self, sender_name: str, sender_id: str, content: str,
+        image_descriptions: list[str] | None = None,
+    ) -> int:
         """
         添加一条群聊消息到缓冲区。
+        image_descriptions: 该消息中包含的图片识别结果列表（可选）
         返回当前缓冲区中的消息数量。
         """
         messages = self._load_messages()
-        messages.append({
+        if sender_id and sender_id != "bot":
+            sender_name = f"{sender_name}(ID:{sender_id})"
+
+        msg_data: dict = {
             "sender_name": sender_name,
             "sender_id": sender_id,
             "content": content,
             "timestamp": datetime.now().isoformat(),
-        })
+        }
+        if image_descriptions:
+            msg_data["image_descriptions"] = image_descriptions
+        messages.append(msg_data)
         self._save_messages(messages)
 
         # 记录参与者
@@ -162,16 +192,43 @@ class ChatNovelEngine:
         novel = self._load_novel()
         return novel.get("characters", [])
 
+    @staticmethod
+    def _parse_participant_identity(name: str) -> tuple[str, str]:
+        """拆分群聊昵称和 AstrBot 附加的 (ID:xxx)。"""
+        text = (name or "").strip()
+        m = _re.search(r"\(ID:(.*?)\)\s*$", text, _re.IGNORECASE)
+        if not m:
+            return text, ""
+        display = text[:m.start()].strip() or text
+        return display, m.group(1).strip()
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        display, _ = ChatNovelEngine._parse_participant_identity(name)
+        return _re.sub(r"\s+", "", display).lower()
+
     def _update_characters(self, new_chars: list[dict]) -> None:
         """更新人物列表（去重合并，跳过已锁定的角色）"""
         novel = self._load_novel()
         existing = novel.get("characters", [])
         existing_ids = {c.get("sender_id") for c in existing}
         existing_names = {c.get("real_name") for c in existing}
+        existing_display = {
+            self._normalize_name(c.get("real_name", "")): c
+            for c in existing
+            if self._normalize_name(c.get("real_name", ""))
+        }
 
         for ch in new_chars:
             sid = ch.get("sender_id", "")
             rname = ch.get("real_name", "")
+
+            if not sid and "(ID:" in rname:
+                _, parsed_sid = self._parse_participant_identity(rname)
+                if parsed_sid:
+                    sid = parsed_sid
+                    ch["sender_id"] = sid
+
             if sid and sid in existing_ids:
                 # 更新已有角色的描述（跳过锁定角色）
                 for e in existing:
@@ -192,10 +249,23 @@ class ChatNovelEngine:
                         if ch.get("description"):
                             e["description"] = ch["description"]
                         break
+            elif self._normalize_name(rname) in existing_display:
+                e = existing_display[self._normalize_name(rname)]
+                if not e.get("locked"):
+                    if sid and not e.get("sender_id"):
+                        e["sender_id"] = sid
+                        existing_ids.add(sid)
+                    if ch.get("description"):
+                        e["description"] = ch["description"]
+                    if ch.get("novel_name"):
+                        e["novel_name"] = ch["novel_name"]
             else:
                 existing.append(ch)
                 existing_ids.add(sid)
                 existing_names.add(rname)
+                norm = self._normalize_name(rname)
+                if norm:
+                    existing_display[norm] = ch
 
         novel["characters"] = existing
         self._save_novel(novel)
@@ -239,6 +309,525 @@ class ChatNovelEngine:
         return None
 
     # ------------------------------------------------------------------
+    # HCA/CSA 记忆管理
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _as_text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return "、".join(ChatNovelEngine._as_text(v) for v in value if ChatNovelEngine._as_text(v))
+        if isinstance(value, dict):
+            parts = []
+            for key, val in value.items():
+                text = ChatNovelEngine._as_text(val)
+                if text:
+                    parts.append(f"{key}: {text}")
+            return "；".join(parts)
+        return str(value).strip()
+
+    @staticmethod
+    def _as_list(value) -> list:
+        if value is None or value == "":
+            return []
+        if isinstance(value, list):
+            return [v for v in value if v not in (None, "")]
+        return [value]
+
+    @staticmethod
+    def _limit_list(value, limit: int = 12) -> list[str]:
+        items = []
+        for item in ChatNovelEngine._as_list(value):
+            text = ChatNovelEngine._as_text(item)
+            if text and text not in items:
+                items.append(text[:120])
+            if len(items) >= limit:
+                break
+        return items
+
+    @staticmethod
+    def _extract_search_terms(text: str, limit: int = 1600) -> set[str]:
+        """轻量关键词/中文 ngram 提取，用于无 embedding 的 CSA 召回。"""
+        if not text:
+            return set()
+        text = str(text).lower()
+        terms: set[str] = set()
+        terms.update(_re.findall(r"[a-z0-9_]{2,}", text))
+
+        for seg in _re.findall(r"[\u4e00-\u9fff]{2,}", text):
+            if len(seg) <= 8:
+                terms.add(seg)
+            for n in (2, 3, 4):
+                if len(seg) < n:
+                    continue
+                for i in range(len(seg) - n + 1):
+                    terms.add(seg[i:i + n])
+                    if len(terms) >= limit:
+                        return terms
+        return terms
+
+    def _ensure_story_bible(self, novel: dict) -> dict:
+        defaults = {
+            "mainline": "",
+            "current_arc": "",
+            "core_conflict": "",
+            "narrative_tone": "",
+            "world_state": "",
+            "character_states": [],
+            "unresolved_hooks": [],
+            "resolved_hooks": [],
+            "important_facts": [],
+            "next_direction": "",
+            "last_updated_chapter": 0,
+        }
+        raw = novel.get("story_bible")
+        bible = raw if isinstance(raw, dict) else {}
+        for key, value in defaults.items():
+            if key not in bible:
+                bible[key] = value
+        if not bible.get("mainline") and novel.get("requirements"):
+            bible["mainline"] = f"围绕「{novel.get('requirements', '')}」展开群像故事。"
+        if not bible.get("current_arc") and novel.get("global_summary"):
+            bible["current_arc"] = novel.get("global_summary", "")
+        return bible
+
+    def _format_story_bible(self, novel: dict) -> str:
+        bible = self._ensure_story_bible(novel)
+        lines = [
+            f"主线目标：{bible.get('mainline') or '尚未明确，请在本章建立清晰主线'}",
+            f"当前篇章：{bible.get('current_arc') or '尚未明确'}",
+            f"核心冲突：{bible.get('core_conflict') or '尚未明确'}",
+            f"叙事基调：{bible.get('narrative_tone') or novel.get('requirements') or '遵循用户要求'}",
+            f"世界/局势：{bible.get('world_state') or '暂无明确变化'}",
+        ]
+
+        def append_list(title: str, items: list[str], empty: str) -> None:
+            lines.append(f"{title}：")
+            if items:
+                for item in items[:12]:
+                    lines.append(f"- {item}")
+            else:
+                lines.append(f"- {empty}")
+
+        append_list("重要角色状态", self._limit_list(bible.get("character_states"), 12), "暂无")
+        append_list("未解决伏笔", self._limit_list(bible.get("unresolved_hooks"), 12), "暂无")
+        append_list("必须记住的事实", self._limit_list(bible.get("important_facts"), 12), "暂无")
+        lines.append(f"下一步方向：{bible.get('next_direction') or '承接上一章自然推进'}")
+        return "\n".join(lines)
+
+    def _format_custom_settings(self, novel: dict) -> str:
+        settings = novel.get("custom_settings", [])
+        if not settings:
+            return "无。"
+        lines = []
+        for i, setting in enumerate(settings, 1):
+            lines.append(f"{i}. {setting.get('content', '')}")
+        return "\n".join(lines)
+
+    def _format_recent_context(self, novel: dict) -> str:
+        chapters = novel.get("chapters", [])
+        if not chapters:
+            return "这是第一章，没有近邻章节。"
+        lines = []
+        for ch in chapters[-2:]:
+            content = ch.get("content", "")
+            ending = content[-500:] if content else ""
+            lines.append(
+                f"第{ch.get('number')}章「{ch.get('title', '')}」\n"
+                f"摘要：{ch.get('summary', '无摘要')}\n"
+                f"结尾片段：{ending or '无'}"
+            )
+        return "\n\n".join(lines)
+
+    def _format_previous_chapters(self, novel: dict, memory_enabled: bool = True) -> str:
+        chapters = novel.get("chapters", [])
+        if not chapters:
+            return "这是第一章，没有前序章节。"
+        if not memory_enabled or len(chapters) <= 6:
+            return "\n".join(
+                f"第{ch.get('number')}章「{ch.get('title', '')}」：{ch.get('summary', '无摘要')}"
+                for ch in chapters
+            )
+        latest = chapters[-3:]
+        lines = [
+            f"已有 {len(chapters)} 章。较早章节细节请优先参考 HCA 故事档案和 CSA 相关记忆召回。",
+            "最近章节概要：",
+        ]
+        lines.extend(
+            f"第{ch.get('number')}章「{ch.get('title', '')}」：{ch.get('summary', '无摘要')}"
+            for ch in latest
+        )
+        return "\n".join(lines)
+
+    def _retrieve_relevant_memories(
+        self,
+        novel: dict,
+        chat_log: str,
+        participants: set[str],
+        chars: list[dict],
+        top_k: int = 8,
+    ) -> list[dict]:
+        if top_k <= 0:
+            return []
+
+        bible = self._ensure_story_bible(novel)
+        query_parts = [
+            chat_log[:4000],
+            novel.get("requirements", ""),
+            bible.get("mainline", ""),
+            bible.get("current_arc", ""),
+            bible.get("core_conflict", ""),
+            bible.get("next_direction", ""),
+            " ".join(participants),
+        ]
+        query_text = "\n".join(query_parts)
+        query_terms = self._extract_search_terms(query_text)
+
+        active_names: set[str] = set()
+        for name in participants:
+            name_text = str(name).lower()
+            if name_text:
+                active_names.add(name_text)
+            m = _re.search(r"^(.*?)\(id:.*?\)$", name_text)
+            if m and m.group(1).strip():
+                active_names.add(m.group(1).strip())
+        for ch in chars:
+            real = ch.get("real_name", "")
+            novel_name = ch.get("novel_name", "")
+            sender_id = str(ch.get("sender_id", ""))
+            if (
+                (real and real in query_text)
+                or (novel_name and novel_name in query_text)
+                or (sender_id and sender_id in query_text)
+            ):
+                active_names.add(real.lower())
+                active_names.add(novel_name.lower())
+                query_terms.update(self._extract_search_terms(f"{real} {novel_name}", 100))
+
+        chapters = novel.get("chapters", [])
+        latest_number = max([int(ch.get("number", 0) or 0) for ch in chapters] + [1])
+
+        candidates: list[dict] = []
+        for entry in novel.get("memory_entries", []):
+            if isinstance(entry, dict):
+                candidates.append(dict(entry))
+
+        known_chapter_entries = {
+            int(e.get("chapter_number", 0) or 0)
+            for e in candidates
+            if isinstance(e, dict) and e.get("type") == "chapter_summary"
+        }
+        for ch in chapters:
+            number = int(ch.get("number", 0) or 0)
+            if number in known_chapter_entries:
+                continue
+            candidates.append({
+                "id": f"chapter-{number}-summary",
+                "type": "chapter_summary",
+                "chapter_number": number,
+                "chapter_title": ch.get("title", ""),
+                "title": f"第{number}章概要",
+                "content": ch.get("summary") or truncate_text(ch.get("content", ""), 220),
+                "characters": [],
+                "keywords": [],
+                "importance": 3,
+            })
+
+        scored: list[tuple[float, dict]] = []
+        for entry in candidates:
+            content = " ".join([
+                self._as_text(entry.get("title")),
+                self._as_text(entry.get("content")),
+                self._as_text(entry.get("chapter_title")),
+                self._as_text(entry.get("characters")),
+                self._as_text(entry.get("keywords")),
+            ])
+            entry_terms = self._extract_search_terms(content)
+            if not entry_terms:
+                continue
+            overlap = len(query_terms & entry_terms)
+            chars_text = self._as_text(entry.get("characters")).lower()
+            char_overlap = sum(1 for name in active_names if name and name in chars_text)
+            try:
+                importance = int(entry.get("importance", 3) or 3)
+            except Exception:
+                importance = 3
+            chapter_number = int(entry.get("chapter_number", 0) or 0)
+            recency = chapter_number / latest_number if latest_number else 0
+            entry_type = self._as_text(entry.get("type")).lower()
+            type_boost = 0.0
+            if any(key in entry_type for key in ("hook", "伏笔", "conflict", "冲突", "mainline", "主线")):
+                type_boost += 2.0
+            if chapter_number and latest_number - chapter_number <= 2:
+                type_boost += 1.2
+            score = overlap * 2.4 + char_overlap * 8.0 + importance * 1.2 + recency * 2.0 + type_boost
+            if score > 0:
+                entry["_score"] = round(score, 2)
+                scored.append((score, entry))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [entry for _, entry in scored[:top_k]]
+
+    def _format_relevant_memories(self, memories: list[dict]) -> str:
+        if not memories:
+            return "暂无可召回的相关历史记忆。"
+        lines = []
+        for i, entry in enumerate(memories, 1):
+            chapter = entry.get("chapter_number")
+            chapter_part = f"第{chapter}章" if chapter else "历史记忆"
+            title = entry.get("title") or entry.get("chapter_title") or "未命名记忆"
+            content = self._as_text(entry.get("content")) or "无内容"
+            chars = self._as_text(entry.get("characters"))
+            keywords = self._as_text(entry.get("keywords"))
+            tail = []
+            if chars:
+                tail.append(f"角色：{chars}")
+            if keywords:
+                tail.append(f"关键词：{keywords}")
+            suffix = f"（{'；'.join(tail)}）" if tail else ""
+            lines.append(f"{i}. {chapter_part} [{entry.get('type', 'memory')}] {title}：{content}{suffix}")
+        return "\n".join(lines)
+
+    def _merge_story_bible_from_result(self, novel: dict, chapter: dict, result: Optional[dict]) -> None:
+        bible = self._ensure_story_bible(novel)
+        raw = result.get("story_bible") if isinstance(result, dict) else None
+        if isinstance(raw, dict):
+            for key in (
+                "mainline", "current_arc", "core_conflict", "narrative_tone",
+                "world_state", "next_direction",
+            ):
+                text = self._as_text(raw.get(key))
+                if text:
+                    bible[key] = text[:600]
+            for key in ("character_states", "unresolved_hooks", "resolved_hooks", "important_facts"):
+                merged = self._limit_list(raw.get(key), 16)
+                if merged:
+                    bible[key] = merged
+
+        if not bible.get("current_arc") and chapter.get("summary"):
+            bible["current_arc"] = chapter["summary"]
+        if not bible.get("mainline") and novel.get("requirements"):
+            bible["mainline"] = f"围绕「{novel.get('requirements', '')}」展开群像故事。"
+        if not bible.get("next_direction") and chapter.get("summary"):
+            bible["next_direction"] = f"承接第{chapter.get('number')}章：{chapter.get('summary')}"
+        bible["last_updated_chapter"] = chapter.get("number", 0)
+        novel["story_bible"] = bible
+
+    def _add_chapter_memory_entries(self, novel: dict, chapter: dict, result: Optional[dict]) -> None:
+        chapter_number = int(chapter.get("number", 0) or 0)
+        entries = [
+            e for e in novel.get("memory_entries", [])
+            if not (isinstance(e, dict) and int(e.get("chapter_number", 0) or 0) == chapter_number)
+        ]
+        raw_entries = result.get("memory_entries") if isinstance(result, dict) else None
+        new_entries: list[dict] = []
+        if isinstance(raw_entries, list):
+            for idx, raw in enumerate(raw_entries[:12], 1):
+                if not isinstance(raw, dict):
+                    continue
+                content = self._as_text(raw.get("content"))
+                if not content:
+                    continue
+                new_entries.append({
+                    "id": f"ch{chapter_number}-{idx}-{generate_id()[:6]}",
+                    "type": self._as_text(raw.get("type")) or "event",
+                    "chapter_number": chapter_number,
+                    "chapter_title": chapter.get("title", ""),
+                    "title": self._as_text(raw.get("title")) or f"第{chapter_number}章记忆",
+                    "content": content[:500],
+                    "characters": self._limit_list(raw.get("characters"), 8),
+                    "keywords": self._limit_list(raw.get("keywords"), 10),
+                    "importance": raw.get("importance", 3),
+                    "created_at": datetime.now().isoformat(),
+                })
+
+        if not new_entries:
+            new_entries.append({
+                "id": f"ch{chapter_number}-summary-{generate_id()[:6]}",
+                "type": "chapter_summary",
+                "chapter_number": chapter_number,
+                "chapter_title": chapter.get("title", ""),
+                "title": f"第{chapter_number}章概要",
+                "content": chapter.get("summary") or truncate_text(chapter.get("content", ""), 240),
+                "characters": [],
+                "keywords": self._limit_list([
+                    chapter.get("title", ""),
+                    novel.get("title", ""),
+                ], 6),
+                "importance": 3,
+                "created_at": datetime.now().isoformat(),
+            })
+
+        entries.extend(new_entries)
+        novel["memory_entries"] = entries[-_MAX_MEMORY_ENTRIES:]
+
+    @staticmethod
+    def _strip_wrapping_code_fence(text: str) -> str:
+        text = (text or "").strip()
+        m = _re.match(r"^```(?:[a-zA-Z0-9_-]+)?\s*\n?(.*?)\n?```\s*$", text, _re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        return text
+
+    @staticmethod
+    def _extract_json_string_field(text: str, field: str) -> str:
+        """从完整或残缺 JSON 文本中尽量提取字符串字段。"""
+        if not text:
+            return ""
+        m = _re.search(rf'"{_re.escape(field)}"\s*:\s*"', text, _re.DOTALL)
+        if not m:
+            return ""
+
+        i = m.end()
+        chars: list[str] = []
+        escaping = False
+        while i < len(text):
+            ch = text[i]
+            if escaping:
+                if ch == "n":
+                    chars.append("\n")
+                elif ch == "r":
+                    chars.append("\r")
+                elif ch == "t":
+                    chars.append("\t")
+                elif ch == "b":
+                    chars.append("\b")
+                elif ch == "f":
+                    chars.append("\f")
+                elif ch == "u" and i + 4 < len(text):
+                    code = text[i + 1:i + 5]
+                    try:
+                        chars.append(chr(int(code, 16)))
+                        i += 4
+                    except ValueError:
+                        chars.append(ch)
+                else:
+                    chars.append(ch)
+                escaping = False
+            elif ch == "\\":
+                escaping = True
+            elif ch == '"':
+                break
+            else:
+                chars.append(ch)
+            i += 1
+        return "".join(chars).strip()
+
+    def _clean_chapter_content(self, text: str) -> str:
+        text = self._strip_wrapping_code_fence(text)
+        probe = text.lstrip()
+        if probe.startswith("{") or probe.startswith("```json") or '"content"' in probe[:500]:
+            extracted = self._extract_json_string_field(probe, "content")
+            if extracted:
+                return self._strip_wrapping_code_fence(extracted).strip()
+        return text.strip()
+
+    @staticmethod
+    def _strip_leading_chapter_heading(content: str, title: str = "") -> str:
+        """移除模型误写进正文开头的章节标题行。"""
+        if not content:
+            return ""
+        lines = content.splitlines()
+        idx = 0
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx >= len(lines):
+            return content.strip()
+
+        first = lines[idx].strip().lstrip("#").strip()
+        normalized_first = _re.sub(r"[\s　：:，,。、《》「」\"'“”‘’\-—_]+", "", first)
+        normalized_title = _re.sub(r"[\s　：:，,。、《》「」\"'“”‘’\-—_]+", "", title or "")
+        is_chapter_heading = bool(
+            _re.match(r"^第\s*[\d一二三四五六七八九十百千万零〇两]+\s*章", first)
+        )
+        is_duplicate_title = bool(
+            normalized_title and normalized_first == normalized_title
+        )
+
+        if len(first) <= 80 and (is_chapter_heading or is_duplicate_title):
+            del lines[idx]
+            while idx < len(lines) and not lines[idx].strip():
+                del lines[idx]
+            return "\n".join(lines).strip()
+        return content.strip()
+
+    async def _extract_chapter_metadata(
+        self,
+        provider,
+        novel: dict,
+        chapter_number: int,
+        chapter_content: str,
+        story_bible: str,
+        recent_context: str,
+        relevant_memories: str,
+        chars_info: str,
+        chat_log: str,
+        next_plot_direction: str = "",
+    ) -> dict:
+        prompt = CHAT_NOVEL_EXTRACT_CHAPTER_METADATA_PROMPT.format(
+            novel_title=novel.get("title", "群聊物语"),
+            chapter_number=chapter_number,
+            requirements=novel.get("requirements", "无特殊要求"),
+            next_plot_direction=next_plot_direction or "无。",
+            story_bible=story_bible[:3000],
+            global_summary=novel.get("global_summary", "故事尚未开始"),
+            recent_context=recent_context[:1800],
+            relevant_memories=relevant_memories[:2500],
+            characters_info=chars_info[:2500],
+            chat_log=chat_log[:3000],
+            chapter_content=chapter_content[:6000],
+        )
+        try:
+            response = await call_llm(provider, prompt, timeout=120)
+            result = parse_json_from_response(response)
+            if isinstance(result, dict):
+                return result
+            logger.warning(f"[{PLUGIN_ID}] 群聊小说元数据提取结果解析失败，将使用兜底摘要")
+            return {}
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_ID}] 群聊小说元数据提取失败: {e}")
+            return {}
+
+    async def _run_plot_check(
+        self,
+        provider,
+        chapter: dict,
+        story_bible: str,
+        recent_context: str,
+        relevant_memories: str,
+        chat_log: str,
+    ) -> Optional[dict]:
+        prompt = CHAT_NOVEL_PLOT_CHECK_PROMPT.format(
+            story_bible=story_bible[:3000],
+            recent_context=recent_context[:1800],
+            relevant_memories=relevant_memories[:2500],
+            chat_log=chat_log[:2500],
+            chapter_title=chapter.get("title", ""),
+            chapter_content=chapter.get("content", "")[:5000],
+        )
+        try:
+            response = await call_llm(provider, prompt, timeout=120)
+            result = parse_json_from_response(response)
+            if not isinstance(result, dict):
+                return None
+            return {
+                "passed": bool(result.get("passed", True)),
+                "mainline_progress_score": result.get("mainline_progress_score", 0),
+                "continuity_score": result.get("continuity_score", 0),
+                "conflict_score": result.get("conflict_score", 0),
+                "hook_score": result.get("hook_score", 0),
+                "issues": self._limit_list(result.get("issues"), 8),
+                "suggestions": self._limit_list(result.get("suggestions"), 8),
+                "summary": self._as_text(result.get("summary"))[:300],
+                "checked_at": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_ID}] 群聊小说剧情检查失败: {e}")
+            return None
+
+    # ------------------------------------------------------------------
     # AI 消息质量评估
     # ------------------------------------------------------------------
     async def evaluate_quality(
@@ -258,7 +847,13 @@ class ChatNovelEngine:
         for msg in messages:
             name = msg.get("sender_name", "未知")
             content = msg.get("content", "")
-            chat_log_lines.append(f"[{name}]: {content}")
+            line = f"[{name}]: {content}"
+            # 附加图片识别结果
+            img_descs = msg.get("image_descriptions", [])
+            if img_descs:
+                for desc in img_descs:
+                    line += f"\n  [图片内容: {desc}]"
+            chat_log_lines.append(line)
         chat_log = "\n".join(chat_log_lines)
 
         prompt = CHAT_NOVEL_EVALUATE_QUALITY_PROMPT.format(
@@ -307,7 +902,12 @@ class ChatNovelEngine:
         for i, msg in enumerate(messages):
             name = msg.get("sender_name", "未知")
             content = msg.get("content", "")
-            chat_log_lines.append(f"[{i}] [{name}]: {content}")
+            line = f"[{i}] [{name}]: {content}"
+            img_descs = msg.get("image_descriptions", [])
+            if img_descs:
+                for desc in img_descs:
+                    line += f"\n  [图片内容: {desc}]"
+            chat_log_lines.append(line)
         chat_log = "\n".join(chat_log_lines)
 
         prompt = CHAT_NOVEL_FILTER_MESSAGES_PROMPT.format(
@@ -350,7 +950,9 @@ class ChatNovelEngine:
     # AI 章节生成
     # ------------------------------------------------------------------
     async def generate_chapter(
-        self, provider, max_word_count: int = 2000, force_ending: bool = False
+        self, provider, max_word_count: int = 2000, force_ending: bool = False,
+        memory_enabled: bool = True, memory_top_k: int = 8,
+        plot_check_enabled: bool = True,
     ) -> Optional[dict]:
         """
         从当前消息缓冲生成新的一章。
@@ -369,7 +971,13 @@ class ChatNovelEngine:
             name = msg.get("sender_name", "未知")
             content = msg.get("content", "")
             participants.add(name)
-            chat_log_lines.append(f"[{name}]: {content}")
+            line = f"[{name}]: {content}"
+            # 附加图片识别结果
+            img_descs = msg.get("image_descriptions", [])
+            if img_descs:
+                for desc in img_descs:
+                    line += f"\n  [图片内容: {desc}]"
+            chat_log_lines.append(line)
         chat_log = "\n".join(chat_log_lines)
 
         # 获取已有人物信息
@@ -383,16 +991,26 @@ class ChatNovelEngine:
         else:
             chars_info = "暂无已有角色，请根据群聊参与者创建角色"
 
-        # 获取前序章节摘要
-        previous_chapters = ""
-        for ch in novel.get("chapters", []):
-            previous_chapters += f"第{ch['number']}章「{ch['title']}」：{ch.get('summary', '无摘要')}\n"
-        if not previous_chapters:
-            previous_chapters = "这是第一章，没有前序章节。"
-
         # 新参与者列表（还未映射为角色的）
         existing_names = {c.get("real_name") for c in chars}
-        new_participants = [p for p in participants if p not in existing_names]
+        existing_ids = {str(c.get("sender_id")) for c in chars if c.get("sender_id")}
+        existing_display_names = {
+            self._normalize_name(c.get("real_name", ""))
+            for c in chars
+            if self._normalize_name(c.get("real_name", ""))
+        }
+
+        new_participants = []
+        for p in participants:
+            if p in existing_names:
+                continue
+            display_name, sender_id = self._parse_participant_identity(p)
+            if sender_id and str(sender_id) in existing_ids:
+                continue
+            if self._normalize_name(display_name) in existing_display_names:
+                continue
+            new_participants.append(p)
+
         new_participants_text = "、".join(new_participants) if new_participants else "无新参与者"
 
         chapter_number = len(novel.get("chapters", [])) + 1
@@ -409,11 +1027,36 @@ class ChatNovelEngine:
                 chars_info = "\n".join([
                     f"- {c.get('real_name', '?')} → 小说名: {c.get('novel_name', '?')}，设定: {c.get('description', '暂无')}"
                     for c in chars
-                ])
+                ]) if chars else "暂无已有角色，请根据群聊参与者创建角色"
             except Exception as e:
                 logger.warning(f"[{PLUGIN_ID}] 群聊小说角色映射失败: {e}")
 
         # 2. 生成章节
+        previous_chapters = self._format_previous_chapters(
+            novel, memory_enabled=memory_enabled
+        )
+        story_bible_text = (
+            self._format_story_bible(novel)
+            if memory_enabled else "未启用 HCA 故事档案。"
+        )
+        recent_context = self._format_recent_context(novel)
+        retrieved_memories = (
+            self._retrieve_relevant_memories(
+                novel, chat_log, participants, chars, top_k=memory_top_k
+            )
+            if memory_enabled else []
+        )
+        relevant_memories_text = self._format_relevant_memories(retrieved_memories)
+        custom_settings_text = self._format_custom_settings(novel)
+        next_plot_direction = (novel.get("next_plot_direction") or "").strip()
+        next_plot_direction_text = next_plot_direction or "无。"
+
+        if memory_enabled:
+            logger.info(
+                f"[{PLUGIN_ID}] 群聊小说 HCA/CSA 上下文："
+                f"召回 {len(retrieved_memories)} 条相关记忆"
+            )
+
         # 构建结局指令（如有）
         ending_instruction = ""
         if force_ending:
@@ -424,12 +1067,17 @@ class ChatNovelEngine:
                 "结尾要有仪式感，让读者感受到故事的圆满收束。\n\n"
             )
 
-        prompt = CHAT_NOVEL_GENERATE_CHAPTER_PROMPT.format(
+        prompt = CHAT_NOVEL_GENERATE_CHAPTER_TEXT_PROMPT.format(
             novel_title=novel.get("title", "群聊物语"),
             chapter_number=chapter_number,
             requirements=novel.get("requirements", "无特殊要求"),
+            custom_settings=custom_settings_text,
+            next_plot_direction=next_plot_direction_text,
+            story_bible=story_bible_text,
             global_summary=novel.get("global_summary", "故事尚未开始"),
+            recent_context=recent_context,
             previous_chapters=previous_chapters,
+            relevant_memories=relevant_memories_text,
             characters_info=chars_info,
             chat_log=chat_log[:6000],
             new_participants=new_participants_text,
@@ -439,23 +1087,56 @@ class ChatNovelEngine:
 
         try:
             response = await call_llm(provider, prompt, timeout=240)
-            result = parse_json_from_response(response)
+            response_probe = response.lstrip()
+            legacy_result = None
+            if (
+                response_probe.startswith("{")
+                or response_probe.startswith("```json")
+                or '"content"' in response_probe[:800]
+            ):
+                legacy_result = parse_json_from_response(response)
+            if not isinstance(legacy_result, dict) or not legacy_result.get("content"):
+                legacy_result = None
 
-            if not result:
-                # 如果 AI 没有返回 JSON，尝试把整个响应当作章节内容
-                chapter = {
-                    "number": chapter_number,
-                    "title": f"第{chapter_number}章",
-                    "content": response.strip(),
-                    "summary": response.strip()[:200],
-                }
+            if legacy_result:
+                # 兼容旧提示词或模型自作主张返回 JSON 的情况。
+                chapter_content = self._clean_chapter_content(legacy_result.get("content", ""))
+                result = legacy_result
+                logger.info(f"[{PLUGIN_ID}] 群聊小说正文生成返回旧 JSON，已按兼容模式解析")
             else:
-                chapter = {
-                    "number": chapter_number,
-                    "title": result.get("chapter_title", f"第{chapter_number}章"),
-                    "content": result.get("content", response.strip()),
-                    "summary": result.get("summary", ""),
-                }
+                chapter_content = self._clean_chapter_content(response)
+                result = await self._extract_chapter_metadata(
+                    provider,
+                    novel,
+                    chapter_number,
+                    chapter_content,
+                    story_bible_text,
+                    recent_context,
+                    relevant_memories_text,
+                    chars_info,
+                    chat_log,
+                    next_plot_direction_text,
+                )
+
+            if not chapter_content:
+                logger.error(f"[{PLUGIN_ID}] 群聊小说章节正文为空")
+                return None
+
+            raw_title = result.get("chapter_title", f"第{chapter_number}章") if result else f"第{chapter_number}章"
+            clean_title = self._strip_chapter_prefix(raw_title) or "未命名"
+            chapter_content = self._strip_leading_chapter_heading(chapter_content, clean_title)
+            if not chapter_content:
+                logger.error(f"[{PLUGIN_ID}] 群聊小说章节正文清理后为空")
+                return None
+
+            chapter = {
+                "number": chapter_number,
+                "title": clean_title,
+                "content": chapter_content,
+                "summary": result.get("summary", "") if result else "",
+            }
+            if not chapter.get("summary"):
+                chapter["summary"] = truncate_text(chapter.get("content", ""), 200)
 
             # 保存章节
             novel["chapters"].append(chapter)
@@ -479,6 +1160,31 @@ class ChatNovelEngine:
                             if cu.get("description"):
                                 c["description"] = cu["description"]
                             break
+
+            if memory_enabled:
+                self._merge_story_bible_from_result(novel, chapter, result)
+                self._add_chapter_memory_entries(novel, chapter, result)
+
+            if plot_check_enabled:
+                plot_check = await self._run_plot_check(
+                    provider,
+                    chapter,
+                    self._format_story_bible(novel),
+                    recent_context,
+                    relevant_memories_text,
+                    chat_log,
+                )
+                if plot_check:
+                    chapter["plot_check"] = plot_check
+                    if not plot_check.get("passed", True):
+                        logger.warning(
+                            f"[{PLUGIN_ID}] 群聊小说剧情检查未通过："
+                            f"{plot_check.get('summary', '')}"
+                        )
+
+            if next_plot_direction:
+                chapter["user_plot_direction"] = next_plot_direction
+                self.clear_next_plot_direction(novel)
 
             self._save_novel(novel)
 
@@ -519,22 +1225,70 @@ class ChatNovelEngine:
             requirements=requirements or "无特殊要求",
         )
 
-        response = await call_llm(provider, prompt, timeout=60)
-        result = parse_json_from_response(response)
-        if not result:
-            return
+        try:
+            response = await call_llm(provider, prompt, timeout=60)
+            result = parse_json_from_response(response)
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_ID}] 群聊小说角色映射 AI 调用失败，将使用兜底角色: {e}")
+            result = None
 
-        new_chars = result.get("characters", [])
+        new_chars = result.get("characters", []) if isinstance(result, dict) else []
         mapped = []
+        participant_map = {}
+        for raw_name in new_names:
+            display_name, sender_id = self._parse_participant_identity(raw_name)
+            participant_map[raw_name] = {
+                "raw": raw_name,
+                "display": display_name,
+                "sender_id": sender_id,
+                "norm": self._normalize_name(display_name),
+            }
+        matched_raw: set[str] = set()
+
+        def find_match(real_name: str) -> Optional[dict]:
+            if real_name in participant_map and real_name not in matched_raw:
+                return participant_map[real_name]
+            display_name, sender_id = self._parse_participant_identity(real_name)
+            norm = self._normalize_name(display_name)
+            if sender_id:
+                for info in participant_map.values():
+                    if info["raw"] not in matched_raw and info["sender_id"] == sender_id:
+                        return info
+            if norm:
+                for info in participant_map.values():
+                    if info["raw"] not in matched_raw and info["norm"] == norm:
+                        return info
+            if len(participant_map) - len(matched_raw) == 1:
+                for info in participant_map.values():
+                    if info["raw"] not in matched_raw:
+                        return info
+            return None
+
         for ch in new_chars:
             real_name = ch.get("real_name", "").strip()
-            if not real_name or real_name not in new_names:
+            if not real_name:
+                continue
+            matched = find_match(real_name)
+            if not matched:
+                continue
+            matched_raw.add(matched["raw"])
+
+            mapped.append({
+                "real_name": matched["raw"],
+                "novel_name": (ch.get("novel_name") or matched["display"] or matched["raw"]).strip(),
+                "description": ch.get("description", "").strip(),
+                "sender_id": matched["sender_id"],
+            })
+
+        # AI 可能省略 ID 或漏掉部分参与者；未匹配到的群友仍创建兜底角色，避免后续出场人物不更新。
+        for info in participant_map.values():
+            if info["raw"] in matched_raw:
                 continue
             mapped.append({
-                "real_name": real_name,
-                "novel_name": ch.get("novel_name", real_name).strip(),
-                "description": ch.get("description", "").strip(),
-                "sender_id": "",
+                "real_name": info["raw"],
+                "novel_name": info["display"] or info["raw"],
+                "description": "暂无描述",
+                "sender_id": info["sender_id"],
             })
 
         if mapped:
@@ -561,6 +1315,26 @@ class ChatNovelEngine:
         """获取所有自定义设定"""
         novel = self._load_novel()
         return novel.get("custom_settings", [])
+
+    def set_next_plot_direction(self, content: str) -> None:
+        """设置下一次章节生成的临时剧情走向。"""
+        novel = self._load_novel()
+        novel["next_plot_direction"] = (content or "").strip()
+        self._save_novel(novel)
+
+    def get_next_plot_direction(self) -> str:
+        """获取下一次章节生成的临时剧情走向。"""
+        novel = self._load_novel()
+        return (novel.get("next_plot_direction") or "").strip()
+
+    def clear_next_plot_direction(self, novel: Optional[dict] = None) -> None:
+        """清空下一次章节生成的临时剧情走向。"""
+        if novel is None:
+            novel = self._load_novel()
+            novel["next_plot_direction"] = ""
+            self._save_novel(novel)
+        else:
+            novel["next_plot_direction"] = ""
 
     # ------------------------------------------------------------------
     # 强制结局
@@ -607,7 +1381,7 @@ class ChatNovelEngine:
     # ------------------------------------------------------------------
     # 角色关系图
     # ------------------------------------------------------------------
-    async def generate_relationship_graph(self, provider) -> Optional[dict]:
+    async def generate_relationship_graph(self, provider, timeout: int = 120) -> Optional[dict]:
         """AI 生成角色关系 Mermaid 代码"""
         novel = self._load_novel()
         chars = novel.get("characters", [])
@@ -631,7 +1405,7 @@ class ChatNovelEngine:
         )
 
         try:
-            response = await call_llm(provider, prompt, timeout=120)
+            response = await call_llm(provider, prompt, timeout=timeout)
             result = parse_json_from_response(response)
             if result and "mermaid_code" in result:
                 code = result["mermaid_code"]
@@ -712,26 +1486,48 @@ class ChatNovelEngine:
 
         try:
             response = await call_llm(provider, prompt, timeout=240)
-            result = parse_json_from_response(response)
+            response_probe = response.lstrip()
+            result = None
+            if (
+                response_probe.startswith("{")
+                or response_probe.startswith("```json")
+                or '"content"' in response_probe[:800]
+            ):
+                result = parse_json_from_response(response)
+            if not isinstance(result, dict) or not result.get("content"):
+                result = None
 
             if not result:
+                content = self._clean_chapter_content(response)
+                title = self._strip_chapter_prefix(target_ch.get("title", f"第{chapter_number}章")) or "未命名"
+                content = self._strip_leading_chapter_heading(content, title)
                 new_chapter = {
                     "number": chapter_number,
-                    "title": target_ch.get("title", f"第{chapter_number}章"),
-                    "content": response.strip(),
-                    "summary": response.strip()[:200],
+                    "title": title,
+                    "content": content,
+                    "summary": truncate_text(content, 200),
                 }
             else:
+                content = self._clean_chapter_content(result.get("content", ""))
+                raw_title = result.get("chapter_title", target_ch.get("title", f"第{chapter_number}章"))
+                title = self._strip_chapter_prefix(raw_title) or "未命名"
+                content = self._strip_leading_chapter_heading(content, title)
                 new_chapter = {
                     "number": chapter_number,
-                    "title": result.get("chapter_title", target_ch.get("title", f"第{chapter_number}章")),
-                    "content": result.get("content", response.strip()),
+                    "title": title,
+                    "content": content,
                     "summary": result.get("summary", ""),
                 }
+            if not new_chapter.get("content"):
+                logger.error(f"[{PLUGIN_ID}] 群聊小说章节重写正文为空")
+                return None
+            if not new_chapter.get("summary"):
+                new_chapter["summary"] = truncate_text(new_chapter.get("content", ""), 200)
 
             # 替换原章节
             chapters[target_idx] = new_chapter
             novel["chapters"] = chapters
+            self._add_chapter_memory_entries(novel, new_chapter, result)
             self._save_novel(novel)
 
             logger.info(
@@ -750,11 +1546,15 @@ class ChatNovelEngine:
     @staticmethod
     def _strip_chapter_prefix(title: str) -> str:
         """去除标题中已有的 '第N章' 前缀，避免与手动拼接的章节号重复"""
-        return _re.sub(r'^第\s*\d+\s*章[：:\s]*', '', title).strip()
+        return _re.sub(
+            r'^第\s*[\d一二三四五六七八九十百千万零〇两]+\s*章[：:\s、，.\-—]*',
+            '',
+            title or '',
+        ).strip()
 
     def reset(self) -> None:
         """删除当前群聊的所有小说数据（人物、章节、消息等）"""
-        self._save_novel(dict(_DEFAULT_CHAT_NOVEL))
+        self._save_novel(_fresh_default_chat_novel())
         self._save_messages([])
         logger.info(f"[{PLUGIN_ID}] 群聊小说数据已重置")
 
@@ -794,7 +1594,9 @@ class ChatNovelEngine:
                 "title": clean_title,
                 "scenes": [{
                     "title": "",
-                    "content": ch.get("content", ""),
+                    "content": self._strip_leading_chapter_heading(
+                        ch.get("content", ""), clean_title
+                    ),
                 }],
             })
         return export_data
@@ -841,7 +1643,9 @@ class ChatNovelEngine:
             lines.append(f"第{ch.get('number', '?')}章 {clean_title}")
             lines.append("=" * 40)
             lines.append("")
-            lines.append(ch.get("content", ""))
+            lines.append(self._strip_leading_chapter_heading(
+                ch.get("content", ""), clean_title
+            ))
             lines.append("")
         return "\n".join(lines)
 
@@ -869,4 +1673,13 @@ class ChatNovelEngine:
         ]
         if novel.get("global_summary"):
             lines.append(f"  故事进展：{truncate_text(novel['global_summary'], 200)}")
+        next_direction = (novel.get("next_plot_direction") or "").strip()
+        if next_direction:
+            lines.append(f"  下一章走向：{truncate_text(next_direction, 120)}")
+        story_bible = novel.get("story_bible", {})
+        if isinstance(story_bible, dict) and story_bible.get("mainline"):
+            lines.append(f"  主线目标：{truncate_text(story_bible['mainline'], 120)}")
+        memories = novel.get("memory_entries", [])
+        if memories:
+            lines.append(f"  历史记忆：{len(memories)} 条")
         return "\n".join(lines)

@@ -1,4 +1,4 @@
-\
+﻿\
 from __future__ import annotations
 
 import asyncio
@@ -27,7 +27,7 @@ try:
 except Exception:  # pragma: no cover
     AstrBotConfig = Any  # type: ignore
 
-from .utils import PLUGIN_ID, truncate_text, generate_cover_image, render_mermaid_to_image
+from .utils import PLUGIN_ID, truncate_text, generate_cover_image, render_mermaid_to_image, recognize_image
 from .knowledge_base import KnowledgeBase
 from .idea_manager import IdeaManager
 from .novel_engine import NovelEngine
@@ -287,7 +287,13 @@ class NovelPlugin(Star):
         logger.info(f"[{PLUGIN_ID}] 正在生成封面图片...")
         timeout = self._cfg_int("cover_image_timeout", 180)
         model = self._cfg("cover_image_model", "").strip()
+        cover_provider_id = self._cfg("provider_cover_image", "").strip()
+        if not model and "gpt-image" in cover_provider_id.lower():
+            model = cover_provider_id.rsplit("/", 1)[-1].strip()
         img_size = self._cfg("cover_image_size", "").strip() or "1024x1536"
+        image_api_key = self._cfg("cover_image_api_key", "").strip()
+        image_base_url = self._cfg("cover_image_base_url", "").strip()
+        image_responses_model = self._cfg("cover_image_responses_model", "").strip()
         try:
             result = await generate_cover_image(
                 provider=provider,
@@ -297,6 +303,9 @@ class NovelPlugin(Star):
                 reference_image_path=ref_path,
                 timeout=timeout,
                 model_name=model,
+                api_key=image_api_key,
+                base_url=image_base_url,
+                responses_model=image_responses_model,
             )
             if result:
                 logger.info(f"[{PLUGIN_ID}] 封面图片生成成功：{result}")
@@ -1445,7 +1454,7 @@ class NovelPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
         msg = (event.message_str or "").strip()
-        if not msg or msg.startswith("/"):
+        if msg.startswith("/"):
             return
 
         gid = event.get_group_id() or ""
@@ -1453,6 +1462,27 @@ class NovelPlugin(Star):
         # 检查群白名单
         if not self._allow(event):
             return
+
+        # 如果消息为空（可能是纯图片消息），检查是否需要处理图片
+        if not msg:
+            # 仅当群聊小说在收集且开启了图片识别时，才继续处理纯图片消息
+            has_images = False
+            if self._cfg_bool("chat_novel_image_recognition_enabled", False):
+                try:
+                    ctx_check = self._get_group_ctx(gid) if gid else None
+                    if ctx_check and ctx_check.chat_novel.is_collecting():
+                        # 检查消息链是否包含图片
+                        if hasattr(event, "message_obj") and event.message_obj:
+                            chain = getattr(event.message_obj, "message", []) or []
+                            for comp in chain:
+                                comp_type_name = type(comp).__name__.lower()
+                                if "image" in comp_type_name:
+                                    has_images = True
+                                    break
+                except Exception:
+                    pass
+            if not has_images:
+                return
 
         # 检查是否有正在收集的用户介入修正
         if gid in self._pending_revision:
@@ -1494,11 +1524,128 @@ class NovelPlugin(Star):
             if not sender_name:
                 sender_name = sender_id or "未知"
 
-            count = ctx.chat_novel.add_message(sender_name, sender_id, msg)
+            # --- 提取图片组件并进行识别 ---
+            image_descriptions: list[str] = []
+            image_recognition_enabled = self._cfg_bool(
+                "chat_novel_image_recognition_enabled", False
+            )
+            if image_recognition_enabled:
+                try:
+                    message_chain = []
+                    if hasattr(event, "message_obj") and event.message_obj:
+                        message_chain = getattr(event.message_obj, "message", []) or []
+
+                    image_urls: list[str] = []
+                    image_paths: list[str] = []
+                    for comp in message_chain:
+                        comp_type = getattr(comp, "type", "")
+                        # 兼容多种判断方式
+                        type_name = ""
+                        if isinstance(comp_type, str):
+                            type_name = comp_type.lower()
+                        elif hasattr(comp_type, "value"):
+                            type_name = str(comp_type.value).lower()
+                        elif hasattr(comp_type, "name"):
+                            type_name = str(comp_type.name).lower()
+                        else:
+                            type_name = type(comp).__name__.lower()
+
+                        if "image" in type_name or type(comp).__name__ == "Image":
+                            # 获取图片 URL
+                            url = (
+                                getattr(comp, "url", "")
+                                or getattr(comp, "file", "")
+                                or getattr(comp, "path", "")
+                                or ""
+                            )
+                            if url:
+                                if url.startswith("http"):
+                                    image_urls.append(url)
+                                else:
+                                    image_paths.append(url)
+
+                    # 对每张图片进行识别
+                    if image_urls or image_paths:
+                        vision_provider = self._get_provider_for("image_recognition")
+                        from pathlib import Path as _Path
+
+                        for img_url in image_urls:
+                            try:
+                                desc = await recognize_image(
+                                    provider=vision_provider,
+                                    image_url=img_url,
+                                    timeout=60,
+                                )
+                                if desc:
+                                    image_descriptions.append(desc)
+                                    logger.info(
+                                        f"[{PLUGIN_ID}] 图片识别完成（URL）："
+                                        f"{len(desc)}字"
+                                    )
+                            except Exception as img_e:
+                                logger.warning(
+                                    f"[{PLUGIN_ID}] 图片识别失败: {img_e}"
+                                )
+
+                        for img_path in image_paths:
+                            try:
+                                desc = await recognize_image(
+                                    provider=vision_provider,
+                                    image_path=_Path(img_path),
+                                    timeout=60,
+                                )
+                                if desc:
+                                    image_descriptions.append(desc)
+                                    logger.info(
+                                        f"[{PLUGIN_ID}] 图片识别完成（本地）："
+                                        f"{len(desc)}字"
+                                    )
+                            except Exception as img_e:
+                                logger.warning(
+                                    f"[{PLUGIN_ID}] 图片识别失败: {img_e}"
+                                )
+                except Exception as e:
+                    logger.warning(
+                        f"[{PLUGIN_ID}] 图片提取/识别异常: {e}"
+                    )
+
+            # 判断是否是机器人自身发送的消息
+            bot_id = ""
+            try:
+                if hasattr(event, "bot_id"):
+                    bot_id = str(event.bot_id)
+                elif hasattr(event, "self_id"):
+                    bot_id = str(event.self_id)
+                elif hasattr(event, "get_self_id"):
+                    bot_id = str(event.get_self_id())
+            except Exception:
+                pass
+
+            collect_bot = self._cfg_bool("chat_novel_collect_bot_messages", False)
+            if not collect_bot and sender_id and bot_id and sender_id == bot_id:
+                return
+
+            # 如果消息没有文字但有图片识别结果，仍然记录
+            if not msg and image_descriptions:
+                msg = "[发送了图片]"
+
+            count = ctx.chat_novel.add_message(
+                sender_name, sender_id, msg,
+                image_descriptions=image_descriptions or None,
+            )
             threshold = self._cfg_int("chat_novel_threshold", 50)
 
             # 每累积 threshold 条消息时触发判断
-            if count >= threshold and count % threshold == 0:
+            trigger_gen = False
+            last_try = getattr(ctx.chat_novel, '_last_try_count', 0)
+            if count >= threshold:
+                if count % threshold == 0:
+                    trigger_gen = True
+                elif count > threshold and last_try < threshold * (count // threshold):
+                    trigger_gen = True
+
+            if trigger_gen:
+                ctx.chat_novel._last_try_count = count
                 # 先评估消息质量
                 yield event.plain_result(
                     f"📝 群聊小说消息已达 {count} 条，正在评估内容质量..."
@@ -1545,11 +1692,17 @@ class NovelPlugin(Star):
                         f"✅ 内容质量充足（{reason}），开始生成新章节，请稍候..."
                     )
                     max_words = self._cfg_int("chat_novel_max_word_count", 2000)
+                    memory_enabled = self._cfg_bool("chat_novel_memory_enabled", True)
+                    memory_top_k = self._cfg_int("chat_novel_memory_top_k", 8)
+                    plot_check_enabled = self._cfg_bool("chat_novel_plot_check_enabled", True)
                     # 检查是否有强制结局标记
                     is_force_ending = ctx.chat_novel.get_force_ending()
                     chapter = await ctx.chat_novel.generate_chapter(
                         provider, max_word_count=max_words,
                         force_ending=is_force_ending,
+                        memory_enabled=memory_enabled,
+                        memory_top_k=memory_top_k,
+                        plot_check_enabled=plot_check_enabled,
                     )
                     if chapter:
                         preview_enabled = ctx.chat_novel.get_preview_enabled()
@@ -1592,6 +1745,42 @@ class NovelPlugin(Star):
                     logger.error(f"[{PLUGIN_ID}] 群聊小说章节生成异常: {e}")
                     yield event.plain_result(f"⚠️ 群聊小说章节生成出错：{e}")
 
+    @filter.after_message_sent()
+    async def on_bot_message_sent(self, event: AstrMessageEvent):
+        """主动捕获机器人自己发出的消息（如果开启了收集）"""
+        gid = event.get_group_id() or ""
+        if not gid:
+            return
+
+        ctx = self._get_group_ctx(gid)
+        if not ctx.chat_novel.is_collecting():
+            return
+
+        collect_bot = self._cfg_bool("chat_novel_collect_bot_messages", False)
+        if not collect_bot:
+            return
+
+        bot_id = "bot"
+        try:
+            if hasattr(event, "bot_id"):
+                bot_id = str(event.bot_id)
+            elif hasattr(event, "self_id"):
+                bot_id = str(event.self_id)
+            elif hasattr(event, "get_self_id"):
+                bot_id = str(event.get_self_id())
+        except Exception:
+            pass
+
+        msg = event.message_str or ""
+        if not msg and hasattr(event, "message_obj") and event.message_obj:
+            msg = getattr(event.message_obj, "message_str", "") or ""
+
+        msg = msg.strip()
+        if not msg:
+            return
+
+        ctx.chat_novel.add_message("Eila", bot_id, msg)
+
     # ==================================================================
     # 群聊小说 命令组（独立于 /小说）
     # ==================================================================
@@ -1604,6 +1793,7 @@ class NovelPlugin(Star):
 ▸ /群聊小说 继续          继续收集（从停止状态恢复）
 ▸ /群聊小说 状态          查看进度
 ▸ /群聊小说 设定 <内容>    添加自定义设定（显示在简介中）
+▸ /群聊小说 剧情走向 <内容>  指定下一次生成的剧情走向（生成后自动清空）
 ▸ /群聊小说 结局          下一次生成强制结局并停止收集
 ▸ /群聊小说 立即生成       跳过阈值立即生成章节
 ▸ /群聊小说 重写 <章节号> <说明>  重写指定章节
@@ -1822,8 +2012,11 @@ class NovelPlugin(Star):
                 f"未找到第 {num} 章。当前共 {len(chapters)} 章。"
             )
             return
-        content = ch.get("content", "")
-        header = f"📖 第{ch['number']}章「{ch.get('title', '')}」\n{'=' * 30}\n\n"
+        title = ctx.chat_novel._strip_chapter_prefix(ch.get("title", "")) or ch.get("title", "")
+        content = ctx.chat_novel._strip_leading_chapter_heading(
+            ch.get("content", ""), title
+        )
+        header = f"📖 第{ch['number']}章「{title}」\n{'=' * 30}\n\n"
         # 分段发送避免消息过长
         if len(content) > 2000:
             yield event.plain_result(header + content[:2000] + "\n\n...（续）")
@@ -1886,14 +2079,20 @@ class NovelPlugin(Star):
             return
         # 从原始消息提取内容
         content = text.strip()
-        if not content:
-            raw_msg = (event.message_str or "").strip()
-            for prefix in ["/群聊小说 设定 ", "/群聊小说 setting ",
-                           "群聊小说 设定 ", "群聊小说 setting "]:
-                idx = raw_msg.find(prefix)
-                if idx >= 0:
-                    content = raw_msg[idx + len(prefix):].strip()
-                    break
+        raw_msg = (event.message_str or "").strip()
+        raw_content = ""
+        for prefix in [
+            "/群聊小说 设定 ", "/群聊小说 setting ",
+            "#群聊小说 设定 ", "#群聊小说 setting ",
+            "群聊小说 设定 ", "群聊小说 setting ",
+        ]:
+            idx = raw_msg.find(prefix)
+            if idx >= 0:
+                raw_content = raw_msg[idx + len(prefix):].strip()
+                break
+        # AstrBot 的命令参数在长文本或特殊空白下可能已被截断，优先保留原始消息中更完整的设定。
+        if raw_content and len(raw_content) > len(content):
+            content = raw_content
         if not content:
             yield event.plain_result(
                 "用法：/群聊小说 设定 <内容>\n"
@@ -1905,6 +2104,66 @@ class NovelPlugin(Star):
             f"✅ 自定义设定已添加！（当前共 {count} 条设定）\n"
             f"📝 内容：{content}\n"
             f"该设定将显示在导出小说的简介中。"
+        )
+
+    @chat_novel_cmd.command("剧情走向", alias={"走向", "下一章", "direction", "plot"})
+    async def cn_next_plot_direction(self, event: AstrMessageEvent, text: str = ""):
+        """指定下一次生成章节的临时剧情走向"""
+        if not self._allow(event):
+            return
+        ctx = self._get_ctx(event)
+        if not ctx:
+            yield event.plain_result("该指令仅允许在群聊使用。")
+            return
+
+        content = text.strip()
+        raw_msg = (event.message_str or "").strip()
+        raw_content = ""
+        for prefix in [
+            "/群聊小说 剧情走向 ", "/群聊小说 走向 ",
+            "/群聊小说 下一章 ",
+            "/群聊小说 direction ", "/群聊小说 plot ",
+            "#群聊小说 剧情走向 ", "#群聊小说 走向 ",
+            "#群聊小说 下一章 ",
+            "#群聊小说 direction ", "#群聊小说 plot ",
+            "群聊小说 剧情走向 ", "群聊小说 走向 ",
+            "群聊小说 下一章 ",
+            "群聊小说 direction ", "群聊小说 plot ",
+        ]:
+            idx = raw_msg.find(prefix)
+            if idx >= 0:
+                raw_content = raw_msg[idx + len(prefix):].strip()
+                break
+        if raw_content and len(raw_content) > len(content):
+            content = raw_content
+
+        if not content:
+            current = ctx.chat_novel.get_next_plot_direction()
+            if current:
+                yield event.plain_result(
+                    "当前已设置下一章剧情走向：\n"
+                    f"{current}\n\n"
+                    "用法：/群聊小说 剧情走向 <内容>\n"
+                    "发送 /群聊小说 剧情走向 清空 可取消。"
+                )
+            else:
+                yield event.plain_result(
+                    "用法：/群聊小说 剧情走向 <内容>\n"
+                    "例如：/群聊小说 剧情走向 下一章让主角团发现内奸，并在结尾留下反转\n"
+                    "该走向只影响下一次章节生成，生成成功后自动清空。"
+                )
+            return
+
+        if content in {"清空", "取消", "删除", "clear", "reset"}:
+            ctx.chat_novel.clear_next_plot_direction()
+            yield event.plain_result("✅ 已清空下一章剧情走向。")
+            return
+
+        ctx.chat_novel.set_next_plot_direction(content)
+        yield event.plain_result(
+            "✅ 已设置下一章剧情走向。\n"
+            f"🧭 {content}\n"
+            "该要求只会影响下一次群聊小说生成，生成成功后自动清空。"
         )
 
     @chat_novel_cmd.command("结局", alias={"ending"})
@@ -1961,12 +2220,18 @@ class NovelPlugin(Star):
 
         provider = self._get_provider_for("writing")
         max_words = self._cfg_int("chat_novel_max_word_count", 2000)
+        memory_enabled = self._cfg_bool("chat_novel_memory_enabled", True)
+        memory_top_k = self._cfg_int("chat_novel_memory_top_k", 8)
+        plot_check_enabled = self._cfg_bool("chat_novel_plot_check_enabled", True)
         is_force_ending = ctx.chat_novel.get_force_ending()
 
         try:
             chapter = await ctx.chat_novel.generate_chapter(
                 provider, max_word_count=max_words,
                 force_ending=is_force_ending,
+                memory_enabled=memory_enabled,
+                memory_top_k=memory_top_k,
+                plot_check_enabled=plot_check_enabled,
             )
             if chapter:
                 content = chapter.get("content", "")
@@ -2083,9 +2348,13 @@ class NovelPlugin(Star):
 
         yield event.plain_result("🔗 正在分析角色关系并生成图片，请稍候...")
 
-        provider = self._get_provider_for("writing")
+        provider = self._get_provider_for("relationship_graph")
+        relationship_timeout = self._cfg_int("chat_novel_relationship_timeout", 120)
         try:
-            result = await ctx.chat_novel.generate_relationship_graph(provider)
+            result = await ctx.chat_novel.generate_relationship_graph(
+                provider,
+                timeout=relationship_timeout,
+            )
             if not result or "mermaid_code" not in result:
                 yield event.plain_result("⚠️ 关系图生成失败，请稍后重试。")
                 return

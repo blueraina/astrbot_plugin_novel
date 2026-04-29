@@ -65,6 +65,12 @@
     "default": "",
     "_special": "select_provider"
   },
+  "provider_relationship_graph": {
+    "type": "string",
+    "description": "群聊小说关系图生成 AI 使用的模型（留空则使用全局默认模型）",
+    "default": "",
+    "_special": "select_provider"
+  },
   "chat_novel_threshold": {
     "type": "int",
     "description": "群聊小说每多少条消息触发一次章节生成",
@@ -79,6 +85,26 @@
     "type": "int",
     "description": "群聊小说生成章节后发送到群聊的预览文本字数上限（0 表示不限制）",
     "default": 800
+  },
+  "chat_novel_memory_enabled": {
+    "type": "bool",
+    "description": "群聊小说是否启用 HCA 故事档案 + CSA 相关记忆召回，用于增强主线和前后文相关度",
+    "default": true
+  },
+  "chat_novel_memory_top_k": {
+    "type": "int",
+    "description": "群聊小说每章生成前召回的相关历史记忆条数",
+    "default": 8
+  },
+  "chat_novel_plot_check_enabled": {
+    "type": "bool",
+    "description": "群聊小说生成章节后是否额外调用一次 AI 做剧情推进/连续性/冲突/伏笔检查",
+    "default": true
+  },
+  "chat_novel_relationship_timeout": {
+    "type": "int",
+    "description": "群聊小说关系图生成的大语言模型调用超时时间（秒）",
+    "default": 120
   },
   "chat_novel_eval_timeout": {
     "type": "int",
@@ -98,7 +124,22 @@
   },
   "cover_image_model": {
     "type": "string",
-    "description": "绘图模型名称（如 seedream-3.0、dall-e-3 等，留空则由 API 自动选择）",
+    "description": "绘图模型名称（如 gpt-image-2、seedream-3.0、dall-e-3 等，留空则由 API 自动选择）",
+    "default": ""
+  },
+  "cover_image_api_key": {
+    "type": "string",
+    "description": "OpenAI Images API Key（可选；填写后封面生成会直接调用 /v1/images/generations 或 /v1/images/edits，适用于 gpt-image-2）",
+    "default": ""
+  },
+  "cover_image_base_url": {
+    "type": "string",
+    "description": "OpenAI Images API Base URL（可选；默认 https://api.openai.com/v1，兼容第三方 OpenAI Images API 网关）",
+    "default": ""
+  },
+  "cover_image_responses_model": {
+    "type": "string",
+    "description": "Responses image_generation 兼容模式使用的主模型（可选；仅当第三方网关的 Images 端点报 image_generation tools 错误时启用，建议填该网关支持的 gpt-4o 或 gpt-5）",
     "default": ""
   },
   "cover_image_size": {
@@ -136,5 +177,21 @@
     "description": "群聊小说消息过滤使用的小模型（留空则使用全局默认模型，建议选择轻量模型以节省成本）",
     "default": "",
     "_special": "select_provider"
+  },
+  "chat_novel_image_recognition_enabled": {
+    "type": "bool",
+    "description": "群聊小说是否开启图片识别功能（开启后 AI 会自动识别群聊中的图片并将内容保存为素材）",
+    "default": false
+  },
+  "provider_image_recognition": {
+    "type": "string",
+    "description": "图片识别使用的视觉模型（需支持图片输入，如 GPT-4o、Gemini Pro Vision 等，留空则使用全局默认模型）",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "chat_novel_collect_bot_messages": {
+    "type": "bool",
+    "description": "群聊小说收集聊天记录时是否包括机器人自己发的信息",
+    "default": false
   }
 }
